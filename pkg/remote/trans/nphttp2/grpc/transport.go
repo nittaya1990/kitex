@@ -15,7 +15,7 @@
  * limitations under the License.
  *
  * This file may have been modified by CloudWeGo authors. All CloudWeGo
- * Modifications are Copyright 2021 CloudWeGo Authors authors.
+ * Modifications are Copyright 2021 CloudWeGo Authors.
  */
 
 // Package grpc defines and implements message oriented communication
@@ -33,11 +33,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
-
-	"github.com/cloudwego/netpoll"
 )
 
 type bufferPool struct {
@@ -276,7 +275,8 @@ type Stream struct {
 
 	// On client-side it is the status error received from the server.
 	// On server-side it is unused.
-	status *status.Status
+	status       *status.Status
+	bizStatusErr kerrors.BizStatusErrorIface
 
 	bytesReceived uint32 // indicates whether any bytes have been received on this stream
 	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
@@ -292,7 +292,7 @@ func (s *Stream) isHeaderSent() bool {
 }
 
 // updateHeaderSent updates headerSent and returns true
-// if it was alreay set. It is valid only on server-side.
+// if it was already set. It is valid only on server-side.
 func (s *Stream) updateHeaderSent() bool {
 	return atomic.SwapUint32(&s.headerSent, 1) == 1
 }
@@ -410,6 +410,14 @@ func (s *Stream) Status() *status.Status {
 	return s.status
 }
 
+func (s *Stream) SetBizStatusErr(bizStatusErr kerrors.BizStatusErrorIface) {
+	s.bizStatusErr = bizStatusErr
+}
+
+func (s *Stream) BizStatusErr() kerrors.BizStatusErrorIface {
+	return s.bizStatusErr
+}
+
 // SetHeader sets the header metadata. This can be called multiple times.
 // Server side only.
 // This should not be called in parallel to other data writes.
@@ -463,7 +471,37 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	return io.ReadFull(s.trReader, p)
 }
 
-// tranportReader reads all the data available for this Stream from the transport and
+// StreamWrite only used for unit test
+func StreamWrite(s *Stream, buffer *bytes.Buffer) {
+	s.write(recvMsg{buffer: buffer})
+}
+
+// CreateStream only used for unit test. Create an independent stream out of http2client / http2server
+func CreateStream(id uint32, requestRead func(i int)) *Stream {
+	recvBuffer := newRecvBuffer()
+	trReader := &transportReader{
+		reader: &recvBufferReader{
+			recv: recvBuffer,
+			freeBuffer: func(buffer *bytes.Buffer) {
+				buffer.Reset()
+			},
+		},
+		windowHandler: func(i int) {},
+	}
+
+	stream := &Stream{
+		id:          id,
+		buf:         recvBuffer,
+		trReader:    trReader,
+		wq:          newWriteQuota(defaultWriteQuota, nil),
+		requestRead: requestRead,
+		hdrMu:       sync.Mutex{},
+	}
+
+	return stream
+}
+
+// transportReader reads all the data available for this Stream from the transport and
 // passes them into the decoder, which converts them into a gRPC message stream.
 // The error is io.EOF when the stream is done or another non-nil error if
 // the stream broke.
@@ -505,16 +543,55 @@ const (
 	draining
 )
 
+// ServerConfig consists of all the configurations to establish a server transport.
+type ServerConfig struct {
+	MaxStreams                 uint32
+	KeepaliveParams            ServerKeepalive
+	KeepaliveEnforcementPolicy EnforcementPolicy
+	InitialWindowSize          uint32
+	InitialConnWindowSize      uint32
+	WriteBufferSize            uint32
+	ReadBufferSize             uint32
+	MaxHeaderListSize          *uint32
+}
+
+func DefaultServerConfig() *ServerConfig {
+	return &ServerConfig{
+		WriteBufferSize: defaultWriteBufferSize,
+		ReadBufferSize:  defaultReadBufferSize,
+	}
+}
+
+// ConnectOptions covers all relevant options for communicating with the server.
+type ConnectOptions struct {
+	// KeepaliveParams stores the keepalive parameters.
+	KeepaliveParams ClientKeepalive
+	// InitialWindowSize sets the initial window size for a stream.
+	InitialWindowSize uint32
+	// InitialConnWindowSize sets the initial window size for a connection.
+	InitialConnWindowSize uint32
+	// WriteBufferSize sets the size of write buffer which in turn determines how much data can be batched before it's written on the wire.
+	WriteBufferSize uint32
+	// ReadBufferSize sets the size of read buffer, which in turn determines how much data can be read at most for one read syscall.
+	ReadBufferSize uint32
+	// MaxHeaderListSize sets the max (uncompressed) size of header list that is prepared to be received.
+	MaxHeaderListSize *uint32
+	// ShortConn indicates whether the connection will be reused from grpc conn pool
+	ShortConn bool
+}
+
 // NewServerTransport creates a ServerTransport with conn or non-nil error
 // if it fails.
-func NewServerTransport(ctx context.Context, conn netpoll.Connection) (ServerTransport, error) {
-	return newHTTP2Server(ctx, conn)
+func NewServerTransport(ctx context.Context, conn net.Conn, cfg *ServerConfig) (ServerTransport, error) {
+	return newHTTP2Server(ctx, conn, cfg)
 }
 
 // NewClientTransport establishes the transport with the required ConnectOptions
 // and returns it to the caller.
-func NewClientTransport(ctx context.Context, conn netpoll.Connection, onGoAway func(GoAwayReason), onClose func()) (ClientTransport, error) {
-	return newHTTP2Client(ctx, conn, onGoAway, onClose)
+func NewClientTransport(ctx context.Context, conn net.Conn, opts ConnectOptions,
+	remoteService string, onGoAway func(GoAwayReason), onClose func(),
+) (ClientTransport, error) {
+	return newHTTP2Client(ctx, conn, opts, remoteService, onGoAway, onClose)
 }
 
 // Options provides additional hints and information for message
@@ -546,6 +623,11 @@ type CallHdr struct {
 	ContentSubtype string
 
 	PreviousAttempts int // value of grpc-previous-rpc-attempts header to set
+}
+
+// IsActive is the interface that exposing the underlying connection's active status.
+type IsActive interface {
+	IsActive() bool
 }
 
 // ClientTransport is the common interface for all gRPC client-side transport

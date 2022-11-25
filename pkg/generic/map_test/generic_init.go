@@ -28,7 +28,6 @@ import (
 	kt "github.com/cloudwego/kitex/internal/mocks/thrift"
 	"github.com/cloudwego/kitex/pkg/generic"
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
-	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/server"
@@ -47,16 +46,6 @@ var reqMsg = map[string]interface{}{
 	},
 }
 
-var respMsg = map[string]interface{}{
-	"Msg":            "world",
-	"required_field": "required_field",
-}
-
-var respMsgWithExtra = map[string]interface{}{
-	"Msg":            "world",
-	"required_field": "required_field",
-	"extra_field":    "extra_field",
-}
 var errResp = "Test Error"
 
 func newGenericClient(destService string, g generic.Generic, targetIPPort string) genericclient.Client {
@@ -73,7 +62,6 @@ func newGenericServer(g generic.Generic, addr net.Addr, handler generic.Service)
 	go func() {
 		err := svr.Run()
 		if err != nil {
-			klog.Errorf("addr=%v bind failed. %s", addr, err)
 			panic(err)
 		}
 	}()
@@ -90,7 +78,7 @@ func (g *GenericServiceImpl) GenericCall(ctx context.Context, method string, req
 	fmt.Printf("Method from Ctx: %s\n", rpcinfo.Invocation().MethodName())
 	fmt.Printf("Recv: %v\n", buf)
 	fmt.Printf("Method: %s\n", method)
-	return respMsgWithExtra, nil
+	return buf, nil
 }
 
 // GenericServiceErrorImpl ...
@@ -170,7 +158,6 @@ func newMockServer(handler kt.Mock, addr net.Addr, opts ...server.Option) server
 	go func() {
 		err := svr.Run()
 		if err != nil {
-			klog.Errorf("addr=%v bind failed. %s", addr, err)
 			panic(err)
 		}
 	}()

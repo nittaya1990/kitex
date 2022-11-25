@@ -15,7 +15,7 @@
  * limitations under the License.
  *
  * This file may have been modified by CloudWeGo authors. All CloudWeGo
- * Modifications are Copyright 2021 CloudWeGo Authors authors.
+ * Modifications are Copyright 2021 CloudWeGo Authors.
  */
 
 package grpc
@@ -34,12 +34,17 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudwego/netpoll"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/cloudwego/kitex/pkg/gofunc"
+	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/grpcframe"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
-	"github.com/cloudwego/netpoll"
-	http2 "github.com/cloudwego/netpoll-http2"
-	"github.com/cloudwego/netpoll-http2/hpack"
-	"google.golang.org/protobuf/proto"
+	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 var (
@@ -60,7 +65,7 @@ type http2Server struct {
 	lastRead    int64
 	ctx         context.Context
 	done        chan struct{}
-	conn        netpoll.Connection
+	conn        net.Conn
 	loopy       *loopyWriter
 	readerDone  chan struct{} // sync point to enable testing.
 	writerDone  chan struct{} // sync point to enable testing.
@@ -111,30 +116,84 @@ type http2Server struct {
 
 // newHTTP2Server constructs a ServerTransport based on HTTP2. ConnectionError is
 // returned if something goes wrong.
-func newHTTP2Server(ctx context.Context, conn netpoll.Connection) (_ ServerTransport, err error) {
-	framer := newFramer(conn, defaultServerMaxHeaderListSize)
+func newHTTP2Server(ctx context.Context, conn net.Conn, config *ServerConfig) (_ ServerTransport, err error) {
+	maxHeaderListSize := defaultServerMaxHeaderListSize
+	if config.MaxHeaderListSize != nil {
+		maxHeaderListSize = *config.MaxHeaderListSize
+	}
+
+	framer := newFramer(conn, config.WriteBufferSize, config.ReadBufferSize, maxHeaderListSize)
 	// Send initial settings as connection preface to client.
 	isettings := []http2.Setting{{
 		ID:  http2.SettingMaxFrameSize,
 		Val: http2MaxFrameLen,
 	}}
-	isettings = append(isettings, http2.Setting{
-		ID:  http2.SettingMaxConcurrentStreams,
-		Val: math.MaxUint32,
-	})
+
+	// 0 is permitted in the HTTP2 spec.
+	maxStreams := config.MaxStreams
+	if maxStreams == 0 {
+		maxStreams = math.MaxUint32
+	} else {
+		isettings = append(isettings, http2.Setting{
+			ID:  http2.SettingMaxConcurrentStreams,
+			Val: maxStreams,
+		})
+	}
+
+	dynamicWindow := true
+	iwz := initialWindowSize
+	if config.InitialWindowSize >= defaultWindowSize {
+		iwz = config.InitialWindowSize
+		dynamicWindow = false
+
+		isettings = append(isettings, http2.Setting{
+			ID:  http2.SettingInitialWindowSize,
+			Val: iwz,
+		})
+	}
+	icwz := initialWindowSize
+	if config.InitialConnWindowSize >= defaultWindowSize {
+		icwz = config.InitialConnWindowSize
+		dynamicWindow = false
+	}
+	if config.MaxHeaderListSize != nil {
+		isettings = append(isettings, http2.Setting{
+			ID:  http2.SettingMaxHeaderListSize,
+			Val: *config.MaxHeaderListSize,
+		})
+	}
+
 	if err := framer.WriteSettings(isettings...); err != nil {
 		return nil, connectionErrorf(false, err, "transport: %v", err)
 	}
 
-	kp := ServerKeepalive{
-		MaxConnectionIdle:     defaultMaxConnectionIdle,
-		MaxConnectionAge:      defaultMaxConnectionAge,
-		MaxConnectionAgeGrace: defaultMaxConnectionAgeGrace,
-		Time:                  30 * time.Second,
-		Timeout:               time.Second,
+	// Adjust the connection flow control window if needed.
+	if icwz > defaultWindowSize {
+		if delta := icwz - defaultWindowSize; delta > 0 {
+			if err := framer.WriteWindowUpdate(0, delta); err != nil {
+				return nil, connectionErrorf(false, err, "transport: %v", err)
+			}
+		}
 	}
-	kep := EnforcementPolicy{
-		MinTime: 20 * time.Second,
+	kp := config.KeepaliveParams
+	if kp.MaxConnectionIdle == 0 {
+		kp.MaxConnectionIdle = defaultMaxConnectionIdle
+	}
+	if kp.MaxConnectionAge == 0 {
+		kp.MaxConnectionAge = defaultMaxConnectionAge
+	}
+	if kp.MaxConnectionAgeGrace == 0 {
+		kp.MaxConnectionAgeGrace = defaultMaxConnectionAgeGrace
+	}
+	if kp.Time == 0 {
+		kp.Time = defaultServerKeepaliveTime
+	}
+	if kp.Timeout == 0 {
+		kp.Timeout = defaultServerKeepaliveTimeout
+	}
+	kep := config.KeepaliveEnforcementPolicy
+	if kep.MinTime == 0 {
+		kep.MinTime = defaultKeepalivePolicyMinTime
 	}
 
 	done := make(chan struct{})
@@ -148,20 +207,22 @@ func newHTTP2Server(ctx context.Context, conn netpoll.Connection) (_ ServerTrans
 		readerDone:        make(chan struct{}),
 		writerDone:        make(chan struct{}),
 		maxStreams:        math.MaxUint32,
-		fc:                &trInFlow{limit: uint32(defaultWindowSize)},
+		fc:                &trInFlow{limit: icwz},
 		state:             reachable,
 		activeStreams:     make(map[uint32]*Stream),
 		kp:                kp,
 		kep:               kep,
 		idle:              time.Now(),
-		initialWindowSize: defaultWindowSize,
+		initialWindowSize: int32(iwz),
 		bufferPool:        newBufferPool(),
 	}
 	t.controlBuf = newControlBuffer(t.done)
-	// t.bdpEst = &bdpEstimator{
-	// 	bdp:               initialWindowSize,
-	// 	updateFlowControl: t.updateFlowControl,
-	// }
+	if dynamicWindow {
+		t.bdpEst = &bdpEstimator{
+			bdp:               initialWindowSize,
+			updateFlowControl: t.updateFlowControl,
+		}
+	}
 
 	t.framer.writer.Flush()
 
@@ -172,8 +233,16 @@ func newHTTP2Server(ctx context.Context, conn netpoll.Connection) (_ ServerTrans
 	}()
 
 	// Check the validity of client preface.
-	preface, err := t.conn.Reader().Next(ClientPrefaceLen)
-	if err != nil {
+	preface := make([]byte, len(ClientPreface))
+	if _, err := io.ReadFull(t.conn, preface); err != nil {
+		// In deployments where a gRPC server runs behind a cloud load balancer
+		// which performs regular TCP level health checks, the connection is
+		// closed immediately by the latter.  Returning io.EOF here allows the
+		// grpc server implementation to recognize this scenario and suppress
+		// logging to reduce spam.
+		if err == io.EOF {
+			return nil, io.EOF
+		}
 		return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to receive the preface from client: %v", err)
 	}
 	if !bytes.Equal(preface, ClientPreface) {
@@ -188,27 +257,28 @@ func newHTTP2Server(ctx context.Context, conn netpoll.Connection) (_ ServerTrans
 		return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
 	}
 	atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
-	sf, ok := frame.(*http2.SettingsFrame)
+	sf, ok := frame.(*grpcframe.SettingsFrame)
 	if !ok {
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 	}
 	t.handleSettings(sf)
 
-	go func() {
+	gofunc.RecoverGoFuncWithInfo(ctx, func() {
 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst)
 		t.loopy.ssGoAwayHandler = t.outgoingGoAwayHandler
-		if err := t.loopy.run(); err != nil {
-			errorf("transport: loopyWriter.run returning. Err: %v", err)
+		if err := t.loopy.run(conn.RemoteAddr().String()); err != nil {
+			klog.CtxErrorf(ctx, "KITEX: grpc server loopyWriter.run returning, error=%v", err)
 		}
 		t.conn.Close()
 		close(t.writerDone)
-	}()
-	go t.keepalive()
+	}, gofunc.NewBasicInfo("", conn.RemoteAddr().String()))
+
+	gofunc.RecoverGoFuncWithInfo(ctx, t.keepalive, gofunc.NewBasicInfo("", conn.RemoteAddr().String()))
 	return t, nil
 }
 
 // operateHeader takes action on the decoded headers.
-func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
+func (t *http2Server) operateHeaders(frame *grpcframe.MetaHeadersFrame, handle func(*Stream), traceCtx func(context.Context, string) context.Context) (fatal bool) {
 	streamID := frame.Header().StreamID
 	state := &decodeState{
 		serverSide: true,
@@ -269,7 +339,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	if streamID%2 != 1 || streamID <= t.maxStreamID {
 		t.mu.Unlock()
 		// illegal gRPC stream id.
-		errorf("transport: http2Server.HandleStreams received an illegal stream id: %v", streamID)
+		klog.CtxErrorf(s.ctx, "transport: http2Server.HandleStreams received an illegal stream id: %v", streamID)
 		s.cancel()
 		return true
 	}
@@ -316,7 +386,7 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		if err != nil {
 			if se, ok := err.(http2.StreamError); ok {
-				warningf("transport: http2Server.HandleStreams encountered http2.StreamError: %v", se)
+				klog.CtxWarnf(t.ctx, "transport: http2Server.HandleStreams encountered http2.StreamError: %v", se)
 				t.mu.Lock()
 				s := t.activeStreams[se.StreamID]
 				t.mu.Unlock()
@@ -336,31 +406,32 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 				t.Close()
 				return
 			}
-			warningf("transport: http2Server.HandleStreams failed to read frame: %v", err)
+			klog.CtxWarnf(t.ctx, "transport: http2Server.HandleStreams failed to read frame: %v", err)
 			t.Close()
 			return
 		}
 		switch frame := frame.(type) {
-		case *http2.MetaHeadersFrame:
+		case *grpcframe.MetaHeadersFrame:
 			if t.operateHeaders(frame, handle, traceCtx) {
 				t.Close()
 				break
 			}
-		case *http2.DataFrame:
+		case *grpcframe.DataFrame:
 			t.handleData(frame)
 		case *http2.RSTStreamFrame:
 			t.handleRSTStream(frame)
-		case *http2.SettingsFrame:
+		case *grpcframe.SettingsFrame:
 			t.handleSettings(frame)
 		case *http2.PingFrame:
 			t.handlePing(frame)
 		case *http2.WindowUpdateFrame:
 			t.handleWindowUpdate(frame)
-		case *http2.GoAwayFrame:
+		case *grpcframe.GoAwayFrame:
 			// TODO: Handle GoAway from the client appropriately.
 		default:
-			errorf("transport: http2Server.HandleStreams found unhandled frame type %v.", frame)
+			klog.CtxErrorf(t.ctx, "transport: http2Server.HandleStreams found unhandled frame type %v.", frame)
 		}
+		t.framer.reader.Release()
 	}
 }
 
@@ -388,6 +459,30 @@ func (t *http2Server) adjustWindow(s *Stream, n uint32) {
 	}
 }
 
+// updateFlowControl updates the incoming flow control windows
+// for the transport and the stream based on the current bdp
+// estimation.
+func (t *http2Server) updateFlowControl(n uint32) {
+	t.mu.Lock()
+	for _, s := range t.activeStreams {
+		s.fc.newLimit(n)
+	}
+	t.initialWindowSize = int32(n)
+	t.mu.Unlock()
+	t.controlBuf.put(&outgoingWindowUpdate{
+		streamID:  0,
+		increment: t.fc.newLimit(n),
+	})
+	t.controlBuf.put(&outgoingSettings{
+		ss: []http2.Setting{
+			{
+				ID:  http2.SettingInitialWindowSize,
+				Val: n,
+			},
+		},
+	})
+}
+
 // updateWindow adjusts the inbound quota for the stream and the transport.
 // Window updates will deliver to the controller for sending when
 // the cumulative quota exceeds the corresponding threshold.
@@ -400,7 +495,7 @@ func (t *http2Server) updateWindow(s *Stream, n uint32) {
 	}
 }
 
-func (t *http2Server) handleData(f *http2.DataFrame) {
+func (t *http2Server) handleData(f *grpcframe.DataFrame) {
 	size := f.Header().Length
 	var sendBDPPing bool
 	if t.bdpEst != nil {
@@ -478,7 +573,7 @@ func (t *http2Server) handleRSTStream(f *http2.RSTStreamFrame) {
 	})
 }
 
-func (t *http2Server) handleSettings(f *http2.SettingsFrame) {
+func (t *http2Server) handleSettings(f *grpcframe.SettingsFrame) {
 	if f.IsAck() {
 		return
 	}
@@ -556,7 +651,7 @@ func (t *http2Server) handlePing(f *http2.PingFrame) {
 
 	if t.pingStrikes > maxPingStrikes {
 		// Send goaway and close the connection.
-		errorf("transport: Got too many pings from the client, closing the connection.")
+		klog.CtxErrorf(t.ctx, "transport: Got too many pings from the client, closing the connection.")
 		t.controlBuf.put(&goAway{code: http2.ErrCodeEnhanceYourCalm, debugData: []byte("too_many_pings"), closeConn: true})
 	}
 }
@@ -589,7 +684,7 @@ func (t *http2Server) checkForHeaderListSize(it interface{}) bool {
 	var sz int64
 	for _, f := range hdrFrame.hf {
 		if sz += int64(f.Size()); sz > int64(*t.maxSendHeaderListSize) {
-			errorf("header list size to send violates the maximum size (%d bytes) set by client", *t.maxSendHeaderListSize)
+			klog.CtxErrorf(t.ctx, "header list size to send violates the maximum size (%d bytes) set by client", *t.maxSendHeaderListSize)
 			return false
 		}
 	}
@@ -622,9 +717,8 @@ func (t *http2Server) setResetPingStrikes() {
 }
 
 func (t *http2Server) writeHeaderLocked(s *Stream) error {
-	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
-	headerFields := make([]hpack.HeaderField, 0, 2) // at least :status, content-type will be there if none else.
+	headerFields := make([]hpack.HeaderField, 0, 3+s.header.Len()) // at least :status, content-type will be there if none else.
 	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: "200"})
 	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: contentType(s.contentSubtype)})
 	if s.sendCompress != "" {
@@ -672,12 +766,19 @@ func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 	}
 	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-status", Value: strconv.Itoa(int(st.Code()))})
 	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-message", Value: encodeGrpcMessage(st.Message())})
+	if bizStatusErr := s.BizStatusErr(); bizStatusErr != nil {
+		headerFields = append(headerFields, hpack.HeaderField{Name: "biz-status", Value: strconv.Itoa(int(bizStatusErr.BizStatusCode()))})
+		if len(bizStatusErr.BizExtra()) != 0 {
+			value, _ := utils.Map2JSONStr(bizStatusErr.BizExtra())
+			headerFields = append(headerFields, hpack.HeaderField{Name: "biz-extra", Value: value})
+		}
+	}
 
 	if p := st.Proto(); p != nil && len(p.Details) > 0 {
 		stBytes, err := proto.Marshal(p)
 		if err != nil {
 			// TODO: return error instead, when callers are able to handle it.
-			errorf("transport: failed to marshal rpc status: %v, error: %v", p, err)
+			klog.CtxErrorf(t.ctx, "transport: failed to marshal rpc status: %v, error: %v", p, err)
 		} else {
 			headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-status-details-bin", Value: encodeBinHeader(stBytes)})
 		}
@@ -731,6 +832,9 @@ func (t *http2Server) Write(s *Stream, hdr, data []byte, opts *Options) error {
 		h:           hdr,
 		d:           data,
 		onEachWrite: t.setResetPingStrikes,
+	}
+	if len(hdr) == 0 && len(data) != 0 {
+		df.dcache = data
 	}
 	if err := s.wq.get(int32(len(hdr) + len(data))); err != nil {
 		select {
@@ -797,7 +901,7 @@ func (t *http2Server) keepalive() {
 			select {
 			case <-ageTimer.C:
 				// Close the connection after grace period.
-				infof("transport: closing server transport due to maximum connection age.")
+				klog.Infof("transport: closing server transport due to maximum connection age.")
 				t.Close()
 			case <-t.done:
 			}
@@ -814,7 +918,7 @@ func (t *http2Server) keepalive() {
 				continue
 			}
 			if outstandingPing && kpTimeoutLeft <= 0 {
-				infof("transport: closing server transport due to idleness.")
+				klog.Infof("transport: closing server transport due to idleness.")
 				t.Close()
 				return
 			}
@@ -973,7 +1077,8 @@ func (t *http2Server) outgoingGoAwayHandler(g *goAway) (bool, error) {
 	if err := t.framer.WritePing(false, goAwayPing.data); err != nil {
 		return false, err
 	}
-	go func() {
+
+	gofunc.RecoverGoFuncWithInfo(context.Background(), func() {
 		timer := time.NewTimer(time.Minute)
 		defer timer.Stop()
 		select {
@@ -983,6 +1088,6 @@ func (t *http2Server) outgoingGoAwayHandler(g *goAway) (bool, error) {
 			return
 		}
 		t.controlBuf.put(&goAway{code: g.code, debugData: g.debugData})
-	}()
+	}, gofunc.EmptyInfo)
 	return false, nil
 }

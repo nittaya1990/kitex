@@ -1,3 +1,19 @@
+/*
+ * Copyright 2021 CloudWeGo Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package transmeta
 
 import (
@@ -5,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
+
 	"github.com/cloudwego/kitex/internal/mocks"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote"
@@ -26,14 +43,14 @@ func TestClientReadMetainfo(t *testing.T) {
 	ctx, err = MetainfoClientHandler.ReadMeta(ctx, msg)
 	test.Assert(t, err == nil)
 
-	kvs := metainfo.GetAllBackwardValues(ctx)
+	kvs := metainfo.RecvAllBackwardValues(ctx)
 	test.Assert(t, len(kvs) == 0)
 
 	ctx = metainfo.WithBackwardValues(context.Background())
 	ctx, err = MetainfoClientHandler.ReadMeta(ctx, msg)
 	test.Assert(t, err == nil)
 
-	kvs = metainfo.GetAllBackwardValues(ctx)
+	kvs = metainfo.RecvAllBackwardValues(ctx)
 	test.Assert(t, len(kvs) == 1)
 	test.Assert(t, kvs["hello"] == "world")
 }
@@ -50,7 +67,9 @@ func TestClientWriteMetainfo(t *testing.T) {
 	test.Assert(t, err == nil)
 
 	kvs := msg.TransInfo().TransStrInfo()
-	test.Assert(t, len(kvs) == 0)
+	test.Assert(t, len(kvs) == 2, kvs)
+	test.Assert(t, kvs[metainfo.PrefixTransient+"tk"] == "tv")
+	test.Assert(t, kvs[metainfo.PrefixPersistent+"pk"] == "pv")
 
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	_, err = MetainfoClientHandler.WriteMeta(ctx, msg)
@@ -79,8 +98,8 @@ func TestServerReadMetainfo(t *testing.T) {
 	tvs := metainfo.GetAllValues(ctx)
 	pvs := metainfo.GetAllPersistentValues(ctx)
 	test.Assert(t, err == nil)
-	test.Assert(t, len(tvs) == 0)
-	test.Assert(t, len(pvs) == 0)
+	test.Assert(t, len(tvs) == 1 && tvs["tk"] == "tv", tvs)
+	test.Assert(t, len(pvs) == 1 && pvs["pk"] == "pv")
 
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	ctx, err = MetainfoServerHandler.ReadMeta(ctx0, msg)
@@ -112,7 +131,7 @@ func TestServerWriteMetainfo(t *testing.T) {
 	ctx, err := MetainfoServerHandler.WriteMeta(ctx, msg)
 	test.Assert(t, err == nil)
 	kvs := msg.TransInfo().TransStrInfo()
-	test.Assert(t, len(kvs) == 0)
+	test.Assert(t, len(kvs) == 1 && kvs["bk"] == "bv", kvs)
 
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	_, err = MetainfoServerHandler.WriteMeta(ctx, msg)

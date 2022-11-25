@@ -31,6 +31,8 @@ type MutableEndpointInfo interface {
 	SetAddress(addr net.Addr) error
 	SetTag(key, value string) error
 	ImmutableView() EndpointInfo
+	Reset()
+	ResetFromBasicInfo(bi *EndpointBasicInfo)
 }
 
 // MutableRPCConfig is used to change the information in the RPCConfig.
@@ -43,8 +45,10 @@ type MutableRPCConfig interface {
 	IsReadWriteTimeoutLocked() bool
 	SetIOBufferSize(sz int) error
 	SetTransportProtocol(tp transport.Protocol) error
+	SetInteractionMode(mode InteractionMode) error
 	LockConfig(bits int)
 	Clone() MutableRPCConfig
+	CopyFrom(from RPCConfig)
 	ImmutableView() RPCConfig
 }
 

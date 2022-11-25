@@ -18,12 +18,14 @@ package trans
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime/debug"
 
 	stats2 "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
@@ -32,12 +34,17 @@ import (
 
 // NewDefaultSvrTransHandler to provide default impl of svrTransHandler, it can be reused in netpoll, shm-ipc, framework-sdk extensions
 func NewDefaultSvrTransHandler(opt *remote.ServerOption, ext Extension) (remote.ServerTransHandler, error) {
-	return &svrTransHandler{
+	svrHdlr := &svrTransHandler{
 		opt:     opt,
 		codec:   opt.Codec,
 		svcInfo: opt.SvcInfo,
 		ext:     ext,
-	}, nil
+	}
+	if svrHdlr.opt.TracerCtl == nil {
+		// init TraceCtl when it is nil, or it will lead some unit tests panic
+		svrHdlr.opt.TracerCtl = &stats2.Controller{}
+	}
+	return svrHdlr, nil
 }
 
 type svrTransHandler struct {
@@ -50,7 +57,7 @@ type svrTransHandler struct {
 }
 
 // Write implements the remote.ServerTransHandler interface.
-func (t *svrTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (err error) {
+func (t *svrTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (nctx context.Context, err error) {
 	var bufWriter remote.ByteBuffer
 	ri := sendMsg.RPCInfo()
 	stats2.Record(ctx, ri, stats.WriteStart, nil)
@@ -61,20 +68,20 @@ func (t *svrTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remo
 
 	if methodInfo, _ := GetMethodInfo(ri, t.svcInfo); methodInfo != nil {
 		if methodInfo.OneWay() {
-			return nil
+			return ctx, nil
 		}
 	}
 
 	bufWriter = t.ext.NewWriteByteBuffer(ctx, conn, sendMsg)
 	err = t.codec.Encode(ctx, sendMsg, bufWriter)
 	if err != nil {
-		return err
+		return ctx, err
 	}
-	return bufWriter.Flush()
+	return ctx, bufWriter.Flush()
 }
 
 // Read implements the remote.ServerTransHandler interface.
-func (t *svrTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remote.Message) (err error) {
+func (t *svrTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remote.Message) (nctx context.Context, err error) {
 	var bufReader remote.ByteBuffer
 	defer func() {
 		t.ext.ReleaseBuffer(bufReader, err)
@@ -83,12 +90,23 @@ func (t *svrTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remot
 	stats2.Record(ctx, recvMsg.RPCInfo(), stats.ReadStart, nil)
 
 	bufReader = t.ext.NewReadByteBuffer(ctx, conn, recvMsg)
-	err = t.codec.Decode(ctx, recvMsg, bufReader)
+	if codec, ok := t.codec.(remote.MetaDecoder); ok {
+		if err = codec.DecodeMeta(ctx, recvMsg, bufReader); err == nil {
+			if t.opt.Profiler != nil && t.opt.ProfilerTransInfoTagging != nil && recvMsg.TransInfo() != nil {
+				var tags []string
+				ctx, tags = t.opt.ProfilerTransInfoTagging(ctx, recvMsg)
+				ctx = t.opt.Profiler.Tag(ctx, tags...)
+			}
+			err = codec.DecodePayload(ctx, recvMsg, bufReader)
+		}
+	} else {
+		err = t.codec.Decode(ctx, recvMsg, bufReader)
+	}
 	if err != nil {
 		recvMsg.Tags()[remote.ReadFailed] = true
-		return err
+		return ctx, err
 	}
-	return nil
+	return ctx, nil
 }
 
 // OnRead implements the remote.ServerTransHandler interface.
@@ -104,22 +122,28 @@ func (t *svrTransHandler) OnRead(ctx context.Context, conn net.Conn) error {
 		if panicErr != nil {
 			closeConn = true
 			if conn != nil {
-				t.opt.Logger.Errorf("KITEX: panic happened, close conn[%s], %v\n%s", conn.RemoteAddr(), panicErr, string(debug.Stack()))
+				ri := rpcinfo.GetRPCInfo(ctx)
+				rService, rAddr := getRemoteInfo(ri, conn)
+				klog.CtxErrorf(ctx, "KITEX: panic happened, close conn, remoteAddress=%s, remoteService=%s, error=%v\nstack=%s", rAddr, rService, panicErr, string(debug.Stack()))
 			} else {
-				t.opt.Logger.Errorf("KITEX: panic happened, %v\n%s", panicErr, string(debug.Stack()))
+				klog.CtxErrorf(ctx, "KITEX: panic happened, error=%v\nstack=%s", panicErr, string(debug.Stack()))
 			}
 		}
 		if closeConn && conn != nil {
 			conn.Close()
 		}
 		t.finishTracer(ctx, ri, err, panicErr)
+		t.finishProfiler(ctx)
 		remote.RecycleMessage(recvMsg)
 		remote.RecycleMessage(sendMsg)
+		// reset rpcinfo
+		t.opt.InitOrResetRPCInfoFunc(ri, conn.RemoteAddr())
 	}()
 	ctx = t.startTracer(ctx, ri)
+	ctx = t.startProfiler(ctx)
 	recvMsg = remote.NewMessageWithNewer(t.svcInfo, ri, remote.Call, remote.Server)
 	recvMsg.SetPayloadCodec(t.opt.PayloadCodec)
-	err = t.Read(ctx, conn, recvMsg)
+	ctx, err = t.Read(ctx, conn, recvMsg)
 	if err != nil {
 		closeConn = true
 		t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, true)
@@ -147,12 +171,13 @@ func (t *svrTransHandler) OnRead(ctx context.Context, conn net.Conn) error {
 		// error cannot be wrapped to print here, so it must exec before NewTransError
 		t.OnError(ctx, err, conn)
 		err = remote.NewTransError(remote.InternalError, err)
-		t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, false)
+		closeConn = t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, false)
 		return nil
 	}
 
 	remote.FillSendMsgFromRecvMsg(recvMsg, sendMsg)
-	if err = t.transPipe.Write(ctx, conn, sendMsg); err != nil {
+	if ctx, err = t.transPipe.Write(ctx, conn, sendMsg); err != nil {
+		closeConn = true
 		t.OnError(ctx, err, conn)
 		return nil
 	}
@@ -169,8 +194,8 @@ func (t *svrTransHandler) OnMessage(ctx context.Context, args, result remote.Mes
 // OnActive implements the remote.ServerTransHandler interface.
 func (t *svrTransHandler) OnActive(ctx context.Context, conn net.Conn) (context.Context, error) {
 	// init rpcinfo
-	_, ctx = t.opt.InitRPCInfoFunc(ctx, conn.RemoteAddr())
-	return ctx, nil
+	ri := t.opt.InitOrResetRPCInfoFunc(nil, conn.RemoteAddr())
+	return rpcinfo.NewCtxWithRPCInfo(ctx, ri), nil
 }
 
 // OnInactive implements the remote.ServerTransHandler interface.
@@ -181,25 +206,22 @@ func (t *svrTransHandler) OnInactive(ctx context.Context, conn net.Conn) {
 
 // OnError implements the remote.ServerTransHandler interface.
 func (t *svrTransHandler) OnError(ctx context.Context, err error, conn net.Conn) {
-	rAddr := conn.RemoteAddr()
-	if rAddr.Network() == "unix" {
-		ri := rpcinfo.GetRPCInfo(ctx)
-		if ri.From().Address() != nil {
-			rAddr = ri.From().Address()
-		}
-	}
+	ri := rpcinfo.GetRPCInfo(ctx)
+	rService, rAddr := getRemoteInfo(ri, conn)
 	if t.ext.IsRemoteClosedErr(err) {
 		// it should not regard error which cause by remote connection closed as server error
-		ri := rpcinfo.GetRPCInfo(ctx)
 		if ri == nil {
 			return
 		}
 		remote := rpcinfo.AsMutableEndpointInfo(ri.From())
 		remote.SetTag(rpcinfo.RemoteClosedTag, "1")
-	} else if pe, ok := err.(*kerrors.DetailedError); ok {
-		t.opt.Logger.Errorf("KITEX: processing request error, remote=%v, err=%s\n%s", rAddr, err.Error(), pe.Stack())
 	} else {
-		t.opt.Logger.Errorf("KITEX: processing request error, remote=%v, err=%s", rAddr, err.Error())
+		var de *kerrors.DetailedError
+		if ok := errors.As(err, &de); ok && de.Stack() != "" {
+			klog.CtxErrorf(ctx, "KITEX: processing request error, remoteService=%s, remoteAddr=%v, error=%s\nstack=%s", rService, rAddr, err.Error(), de.Stack())
+		} else {
+			klog.CtxErrorf(ctx, "KITEX: processing request error, remoteService=%s, remoteAddr=%v, error=%s", rService, rAddr, err.Error())
+		}
 	}
 }
 
@@ -213,7 +235,9 @@ func (t *svrTransHandler) SetPipeline(p *remote.TransPipeline) {
 	t.transPipe = p
 }
 
-func (t *svrTransHandler) writeErrorReplyIfNeeded(ctx context.Context, recvMsg remote.Message, conn net.Conn, err error, ri rpcinfo.RPCInfo, doOnMessage bool) {
+func (t *svrTransHandler) writeErrorReplyIfNeeded(
+	ctx context.Context, recvMsg remote.Message, conn net.Conn, err error, ri rpcinfo.RPCInfo, doOnMessage bool,
+) (shouldCloseConn bool) {
 	if cn, ok := conn.(remote.IsActive); ok && !cn.IsActive() {
 		// conn is closed, no need reply
 		return
@@ -233,14 +257,16 @@ func (t *svrTransHandler) writeErrorReplyIfNeeded(ctx context.Context, recvMsg r
 		// if error happen before normal OnMessage, exec it to transfer header trans info into rpcinfo
 		t.transPipe.OnMessage(ctx, recvMsg, errMsg)
 	}
-	err = t.transPipe.Write(ctx, conn, errMsg)
+	ctx, err = t.transPipe.Write(ctx, conn, errMsg)
 	if err != nil {
-		t.opt.Logger.Errorf("KITEX: write error reply failed, remote=%s, err=%s", conn.RemoteAddr(), err.Error())
+		klog.CtxErrorf(ctx, "KITEX: write error reply failed, remote=%s, error=%s", conn.RemoteAddr(), err.Error())
+		return true
 	}
+	return
 }
 
 func (t *svrTransHandler) startTracer(ctx context.Context, ri rpcinfo.RPCInfo) context.Context {
-	c := t.opt.TracerCtl.DoStart(ctx, ri, t.opt.Logger)
+	c := t.opt.TracerCtl.DoStart(ctx, ri)
 	return c
 }
 
@@ -256,9 +282,36 @@ func (t *svrTransHandler) finishTracer(ctx context.Context, ri rpcinfo.RPCInfo, 
 		// it should not regard the error which caused by remote connection closed as server error
 		err = nil
 	}
-	t.opt.TracerCtl.DoFinish(ctx, ri, err, t.opt.Logger)
+	t.opt.TracerCtl.DoFinish(ctx, ri, err)
 	// for server side, rpcinfo is reused on connection, clear the rpc stats info but keep the level config
 	sl := ri.Stats().Level()
 	rpcStats.Reset()
 	rpcStats.SetLevel(sl)
+}
+
+func (t *svrTransHandler) startProfiler(ctx context.Context) context.Context {
+	if t.opt.Profiler == nil {
+		return ctx
+	}
+	return t.opt.Profiler.Prepare(ctx)
+}
+
+func (t *svrTransHandler) finishProfiler(ctx context.Context) {
+	if t.opt.Profiler == nil {
+		return
+	}
+	t.opt.Profiler.Untag(ctx)
+}
+
+func getRemoteInfo(ri rpcinfo.RPCInfo, conn net.Conn) (string, net.Addr) {
+	rAddr := conn.RemoteAddr()
+	if ri == nil {
+		return "", rAddr
+	}
+	if rAddr != nil && rAddr.Network() == "unix" {
+		if ri.From().Address() != nil {
+			rAddr = ri.From().Address()
+		}
+	}
+	return ri.From().ServiceName(), rAddr
 }

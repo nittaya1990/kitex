@@ -15,7 +15,7 @@
  * limitations under the License.
  *
  * This file may have been modified by CloudWeGo authors. All CloudWeGo
- * Modifications are Copyright 2021 CloudWeGo Authors authors.
+ * Modifications are Copyright 2021 CloudWeGo Authors.
  */
 
 package grpc
@@ -77,7 +77,11 @@ func (b *bdpEstimator) timesnap(d [8]byte) {
 	if bdpPing.data != d {
 		return
 	}
+	// Locking here is to avoid DATA RACE in the unittest.
+	// In fact, it would not bring the concurrency problem.
+	b.mu.Lock()
 	b.sentAt = time.Now()
+	b.mu.Unlock()
 }
 
 // add adds bytes to the current sample for calculating bdp.

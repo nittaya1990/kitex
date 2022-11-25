@@ -32,8 +32,8 @@ var (
 // DummyPool is a dummy implementation of remote.ConnPool.
 type DummyPool struct{}
 
-// Get .
-func (p *DummyPool) Get(ctx context.Context, network, address string, opt *remote.ConnOption) (net.Conn, error) {
+// Get implements the remote.ConnPool interface.
+func (p *DummyPool) Get(ctx context.Context, network, address string, opt remote.ConnOption) (net.Conn, error) {
 	return nil, nil
 }
 

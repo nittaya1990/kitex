@@ -15,13 +15,13 @@
  * limitations under the License.
  *
  * This file may have been modified by CloudWeGo authors. All CloudWeGo
- * Modifications are Copyright 2021 CloudWeGo Authors authors.
+ * Modifications are Copyright 2021 CloudWeGo Authors.
  */
 
-// Package status implements errors returned by gRPC.  These errors are
+// Package status implements errors returned by gRPC. These errors are
 // serialized and transmitted on the wire between server and client, and allow
 // for additional data to be transmitted via the Details field in the status
-// proto.  gRPC service handlers should return an error created by this
+// proto. gRPC service handlers should return an error created by this
 // package, and gRPC clients should expect a corresponding error to be
 // returned from the RPC call.
 //
@@ -41,6 +41,10 @@ import (
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 )
 
+type Iface interface {
+	GRPCStatus() *Status
+}
+
 // Status represents an RPC status code, message, and details.  It is immutable
 // and should be created with New, Newf, or FromProto.
 type Status struct {
@@ -55,6 +59,11 @@ func New(c codes.Code, msg string) *Status {
 // Newf returns New(c, fmt.Sprintf(format, a...)).
 func Newf(c codes.Code, format string, a ...interface{}) *Status {
 	return New(c, fmt.Sprintf(format, a...))
+}
+
+// ErrorProto returns an error representing s.  If s.Code is OK, returns nil.
+func ErrorProto(s *spb.Status) error {
+	return FromProto(s).Err()
 }
 
 // FromProto returns a Status representing s.
@@ -86,6 +95,15 @@ func (s *Status) Message() string {
 		return ""
 	}
 	return s.s.Message
+}
+
+// AppendMessage append extra msg for Status
+func (s *Status) AppendMessage(extraMsg string) *Status {
+	if s == nil || s.s == nil || extraMsg == "" {
+		return s
+	}
+	s.s.Message = fmt.Sprintf("%s %s", s.s.Message, extraMsg)
+	return s
 }
 
 // Proto returns s's status as an spb.Status proto message.
@@ -172,9 +190,8 @@ func FromError(err error) (s *Status, ok bool) {
 	if err == nil {
 		return nil, true
 	}
-	if se, ok := err.(interface {
-		GRPCStatus() *Status
-	}); ok {
+	var se Iface
+	if errors.As(err, &se) {
 		return se.GRPCStatus(), true
 	}
 	return New(codes.Unknown, err.Error()), false
@@ -194,9 +211,8 @@ func Code(err error) codes.Code {
 	if err == nil {
 		return codes.OK
 	}
-	if se, ok := err.(interface {
-		GRPCStatus() *Status
-	}); ok {
+	var se Iface
+	if errors.As(err, &se) {
 		return se.GRPCStatus().Code()
 	}
 	return codes.Unknown

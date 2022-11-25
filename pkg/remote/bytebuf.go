@@ -34,6 +34,14 @@ type NocopyWrite interface {
 	WriteDirect(buf []byte, remainCap int) error
 }
 
+// FrameWrite is to write header and data buffer separately to avoid memory copy
+type FrameWrite interface {
+	// WriteHeader set header buffer without copy
+	WriteHeader(buf []byte) (err error)
+	// WriteData set data buffer without copy
+	WriteData(buf []byte) (err error)
+}
+
 // ByteBuffer is the core abstraction of buffer in Kitex.
 type ByteBuffer interface {
 	io.ReadWriter
@@ -86,7 +94,7 @@ type ByteBuffer interface {
 	// NewBuffer returns a new writable remote.ByteBuffer.
 	NewBuffer() ByteBuffer
 	// AppendBuffer appends buf to the original buffer.
-	AppendBuffer(buf ByteBuffer) (n int, err error)
+	AppendBuffer(buf ByteBuffer) (err error)
 
 	// Bytes return the backing bytes slice of this buffer
 	Bytes() (buf []byte, err error)

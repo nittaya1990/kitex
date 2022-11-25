@@ -29,17 +29,35 @@ import (
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
+var (
+	_ remote.PayloadCodec = &mapThriftCodec{}
+	_ Closer              = &mapThriftCodec{}
+)
+
 type mapThriftCodec struct {
 	svcDsc   atomic.Value // *idl
 	provider DescriptorProvider
 	codec    remote.PayloadCodec
+	forJSON  bool
 }
 
 func newMapThriftCodec(p DescriptorProvider, codec remote.PayloadCodec) (*mapThriftCodec, error) {
 	svc := <-p.Provide()
-	c := &mapThriftCodec{codec: codec, provider: p}
+	c := &mapThriftCodec{
+		codec:    codec,
+		provider: p,
+	}
 	c.svcDsc.Store(svc)
 	go c.update()
+	return c, nil
+}
+
+func newMapThriftCodecForJSON(p DescriptorProvider, codec remote.PayloadCodec) (*mapThriftCodec, error) {
+	c, err := newMapThriftCodec(p, codec)
+	if err != nil {
+		return nil, err
+	}
+	c.forJSON = true
 	return c, nil
 }
 
@@ -81,7 +99,12 @@ func (c *mapThriftCodec) Unmarshal(ctx context.Context, msg remote.Message, in r
 	if !ok {
 		return fmt.Errorf("get parser ServiceDescriptor failed")
 	}
-	rm := thrift.NewReadStruct(svcDsc, msg.RPCRole() == remote.Client)
+	var rm *thrift.ReadStruct
+	if c.forJSON {
+		rm = thrift.NewReadStructForJSON(svcDsc, msg.RPCRole() == remote.Client)
+	} else {
+		rm = thrift.NewReadStruct(svcDsc, msg.RPCRole() == remote.Client)
+	}
 	msg.Data().(WithCodec).SetCodec(rm)
 	return c.codec.Unmarshal(ctx, msg, in)
 }
@@ -96,4 +119,8 @@ func (c *mapThriftCodec) getMethod(req interface{}, method string) (*Method, err
 
 func (c *mapThriftCodec) Name() string {
 	return "MapThrift"
+}
+
+func (c *mapThriftCodec) Close() error {
+	return c.provider.Close()
 }

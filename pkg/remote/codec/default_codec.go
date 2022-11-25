@@ -50,21 +50,41 @@ const (
 var (
 	ttHeaderCodec   = ttHeader{}
 	meshHeaderCodec = meshHeader{}
+
+	_ remote.Codec       = (*defaultCodec)(nil)
+	_ remote.MetaDecoder = (*defaultCodec)(nil)
 )
 
 // NewDefaultCodec creates the default protocol sniffing codec supporting thrift and protobuf.
 func NewDefaultCodec() remote.Codec {
-	return &defaultCodec{}
+	// No size limit by default
+	return &defaultCodec{
+		maxSize: 0,
+	}
 }
 
-type defaultCodec struct{}
+// NewDefaultCodecWithSizeLimit creates the default protocol sniffing codec supporting thrift and protobuf but with size limit.
+// maxSize is in bytes
+func NewDefaultCodecWithSizeLimit(maxSize int) remote.Codec {
+	return &defaultCodec{
+		maxSize: maxSize,
+	}
+}
+
+type defaultCodec struct {
+	// maxSize limits the max size of the payload
+	maxSize int
+}
 
 // Encode implements the remote.Codec interface, it does complete message encode include header and payload.
 func (c *defaultCodec) Encode(ctx context.Context, message remote.Message, out remote.ByteBuffer) error {
 	defer func() {
-		ri := message.RPCInfo()
 		// notice: mallocLen() must exec before flush, or it will be reset
-		rpcinfo.AsMutableRPCStats(ri.Stats()).SetSendSize(uint64(out.MallocLen()))
+		if ri := message.RPCInfo(); ri != nil {
+			if ms := rpcinfo.AsMutableRPCStats(ri.Stats()); ms != nil {
+				ms.SetSendSize(uint64(out.MallocLen()))
+			}
+		}
 	}()
 	var err error
 	var totalLenField []byte
@@ -94,11 +114,13 @@ func (c *defaultCodec) Encode(ctx context.Context, message remote.Message, out r
 	}
 
 	// 4. fill framed field if needed
+	var payloadLen int
 	if tp&transport.Framed == transport.Framed {
 		if framedLenField == nil {
 			return perrors.NewProtocolErrorWithMsg("no buffer allocated for the framed length field")
 		}
-		binary.BigEndian.PutUint32(framedLenField, uint32(out.MallocLen()-headerLen))
+		payloadLen = out.MallocLen() - headerLen
+		binary.BigEndian.PutUint32(framedLenField, uint32(payloadLen))
 	} else if message.ServiceInfo().PayloadCodec == serviceinfo.Protobuf {
 		return perrors.NewProtocolErrorWithMsg("protobuf just support 'framed' trans proto")
 	}
@@ -107,18 +129,14 @@ func (c *defaultCodec) Encode(ctx context.Context, message remote.Message, out r
 		if totalLenField == nil {
 			return perrors.NewProtocolErrorWithMsg("no buffer allocated for the header length field")
 		}
-		binary.BigEndian.PutUint32(totalLenField, uint32(out.MallocLen()-Size32))
+		payloadLen = out.MallocLen() - Size32
+		binary.BigEndian.PutUint32(totalLenField, uint32(payloadLen))
 	}
-	return nil
+	return checkPayloadSize(payloadLen, c.maxSize)
 }
 
-// Decode implements the remote.Codec interface, it does complete message decode include header and payload.
-func (c *defaultCodec) Decode(ctx context.Context, message remote.Message, in remote.ByteBuffer) (err error) {
-	defer func() {
-		ri := message.RPCInfo()
-		rpcinfo.AsMutableRPCStats(ri.Stats()).SetRecvSize(uint64(in.ReadLen()))
-	}()
-
+// DecodeMeta decode header
+func (c *defaultCodec) DecodeMeta(ctx context.Context, message remote.Message, in remote.ByteBuffer) (err error) {
 	var flagBuf []byte
 	if flagBuf, err = in.Peek(2 * Size32); err != nil {
 		return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("default codec read failed: %s", err.Error()))
@@ -128,17 +146,15 @@ func (c *defaultCodec) Decode(ctx context.Context, message remote.Message, in re
 		// there is one call has finished in retry task, it doesn't need to do decode for this call
 		return err
 	}
+	isTTHeader := IsTTHeader(flagBuf)
 	// 1. decode header
-	if IsTTHeader(flagBuf) {
+	if isTTHeader {
 		// TTHeader
 		if err = ttHeaderCodec.decode(ctx, message, in); err != nil {
 			return err
 		}
 		if flagBuf, err = in.Peek(2 * Size32); err != nil {
-			return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("ttheader read payload fisrt 8 byte failed: %s", err.Error()))
-		}
-		if err = checkPayload(flagBuf, message, in, true); err != nil {
-			return err
+			return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("ttheader read payload first 8 byte failed: %s", err.Error()))
 		}
 	} else if isMeshHeader(flagBuf) {
 		message.Tags()[remote.MeshHeader] = true
@@ -147,23 +163,46 @@ func (c *defaultCodec) Decode(ctx context.Context, message remote.Message, in re
 			return err
 		}
 		if flagBuf, err = in.Peek(2 * Size32); err != nil {
-			return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("meshHeader read payload fisrt 8 byte failed: %s", err.Error()))
-		}
-		if err = checkPayload(flagBuf, message, in, false); err != nil {
-			return err
-		}
-	} else {
-		// no Header
-		if err = checkPayload(flagBuf, message, in, false); err != nil {
-			return err
+			return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("meshHeader read payload first 8 byte failed: %s", err.Error()))
 		}
 	}
+	return checkPayload(flagBuf, message, in, isTTHeader, c.maxSize)
+}
 
-	// 2. decode body
-	if err := c.decodePayload(ctx, message, in); err != nil {
+// DecodePayload decode payload
+func (c *defaultCodec) DecodePayload(ctx context.Context, message remote.Message, in remote.ByteBuffer) error {
+	defer func() {
+		if ri := message.RPCInfo(); ri != nil {
+			if ms := rpcinfo.AsMutableRPCStats(ri.Stats()); ms != nil {
+				ms.SetRecvSize(uint64(in.ReadLen()))
+			}
+		}
+	}()
+
+	hasRead := in.ReadLen()
+	pCodec, err := remote.GetPayloadCodec(message)
+	if err != nil {
 		return err
 	}
+	if err = pCodec.Unmarshal(ctx, message, in); err != nil {
+		return err
+	}
+	if message.PayloadLen() == 0 {
+		// if protocol is PurePayload, should set payload length after decoded
+		message.SetPayloadLen(in.ReadLen() - hasRead)
+	}
 	return nil
+}
+
+// Decode implements the remote.Codec interface, it does complete message decode include header and payload.
+func (c *defaultCodec) Decode(ctx context.Context, message remote.Message, in remote.ByteBuffer) (err error) {
+	// 1. decode meta
+	if err = c.DecodeMeta(ctx, message, in); err != nil {
+		return err
+	}
+
+	// 2. decode payload
+	return c.DecodePayload(ctx, message, in)
 }
 
 func (c *defaultCodec) Name() string {
@@ -177,14 +216,6 @@ func (c *defaultCodec) encodePayload(ctx context.Context, message remote.Message
 		return err
 	}
 	return pCodec.Marshal(ctx, message, out)
-}
-
-func (c *defaultCodec) decodePayload(ctx context.Context, message remote.Message, in remote.ByteBuffer) error {
-	pCodec, err := remote.GetPayloadCodec(message)
-	if err != nil {
-		return err
-	}
-	return pCodec.Unmarshal(ctx, message, in)
 }
 
 /**
@@ -247,6 +278,9 @@ func checkRPCState(ctx context.Context, message remote.Message) error {
 	if message.RPCRole() == remote.Server {
 		return nil
 	}
+	if ctx.Err() == context.DeadlineExceeded || ctx.Err() == context.Canceled {
+		return kerrors.ErrRPCFinish
+	}
 	if respOp, ok := ctx.Value(retry.CtxRespOp).(*int32); ok {
 		if !atomic.CompareAndSwapInt32(respOp, retry.OpNo, retry.OpDoing) {
 			// previous call is being handling or done
@@ -257,7 +291,7 @@ func checkRPCState(ctx context.Context, message remote.Message) error {
 	return nil
 }
 
-func checkPayload(flagBuf []byte, message remote.Message, in remote.ByteBuffer, isTTHeader bool) error {
+func checkPayload(flagBuf []byte, message remote.Message, in remote.ByteBuffer, isTTHeader bool, maxPayloadSize int) error {
 	var transProto transport.Protocol
 	var codecType serviceinfo.PayloadCodec
 	if isThriftBinary(flagBuf) {
@@ -276,7 +310,7 @@ func checkPayload(flagBuf []byte, message remote.Message, in remote.ByteBuffer, 
 		}
 		payloadLen := binary.BigEndian.Uint32(flagBuf[:Size32])
 		message.SetPayloadLen(int(payloadLen))
-		if _, err := in.Next(Size32); err != nil {
+		if err := in.Skip(Size32); err != nil {
 			return err
 		}
 	} else if isProtobufKitex(flagBuf) {
@@ -288,7 +322,7 @@ func checkPayload(flagBuf []byte, message remote.Message, in remote.ByteBuffer, 
 		}
 		payloadLen := binary.BigEndian.Uint32(flagBuf[:Size32])
 		message.SetPayloadLen(int(payloadLen))
-		if _, err := in.Next(Size32); err != nil {
+		if err := in.Skip(Size32); err != nil {
 			return err
 		}
 	} else {
@@ -298,6 +332,24 @@ func checkPayload(flagBuf []byte, message remote.Message, in remote.ByteBuffer, 
 		err := perrors.NewProtocolErrorWithMsg(fmt.Sprintf("invalid payload (first4Bytes=%#x, second4Bytes=%#x)", first4Bytes, second4Bytes))
 		return err
 	}
+	if err := checkPayloadSize(message.PayloadLen(), maxPayloadSize); err != nil {
+		return err
+	}
 	message.SetProtocolInfo(remote.NewProtocolInfo(transProto, codecType))
+	cfg := rpcinfo.AsMutableRPCConfig(message.RPCInfo().Config())
+	if cfg != nil {
+		tp := message.ProtocolInfo().TransProto
+		cfg.SetTransportProtocol(tp)
+	}
+	return nil
+}
+
+func checkPayloadSize(payloadLen, maxSize int) error {
+	if maxSize > 0 && payloadLen > 0 && payloadLen > maxSize {
+		return perrors.NewProtocolErrorWithType(
+			perrors.InvalidData,
+			fmt.Sprintf("invalid data: payload size(%d) larger than the limit(%d)", payloadLen, maxSize),
+		)
+	}
 	return nil
 }

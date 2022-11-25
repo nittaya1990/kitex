@@ -34,6 +34,11 @@ import (
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
+var (
+	_ remote.PayloadCodec = &httpThriftCodec{}
+	_ Closer              = &httpThriftCodec{}
+)
+
 // HTTPRequest alias of descriptor HTTPRequest
 type HTTPRequest = descriptor.HTTPRequest
 
@@ -41,14 +46,15 @@ type HTTPRequest = descriptor.HTTPRequest
 type HTTPResponse = descriptor.HTTPResponse
 
 type httpThriftCodec struct {
-	svcDsc   atomic.Value // *idl
-	provider DescriptorProvider
-	codec    remote.PayloadCodec
+	svcDsc           atomic.Value // *idl
+	provider         DescriptorProvider
+	codec            remote.PayloadCodec
+	binaryWithBase64 bool
 }
 
 func newHTTPThriftCodec(p DescriptorProvider, codec remote.PayloadCodec) (*httpThriftCodec, error) {
 	svc := <-p.Provide()
-	c := &httpThriftCodec{codec: codec, provider: p}
+	c := &httpThriftCodec{codec: codec, provider: p, binaryWithBase64: false}
 	c.svcDsc.Store(svc)
 	go c.update()
 	return c, nil
@@ -87,6 +93,7 @@ func (c *httpThriftCodec) Marshal(ctx context.Context, msg remote.Message, out r
 	}
 
 	inner := thrift.NewWriteHTTPRequest(svcDsc)
+	inner.SetBinaryWithBase64(c.binaryWithBase64)
 	msg.Data().(WithCodec).SetCodec(inner)
 	return c.codec.Marshal(ctx, msg, out)
 }
@@ -100,12 +107,17 @@ func (c *httpThriftCodec) Unmarshal(ctx context.Context, msg remote.Message, in 
 		return fmt.Errorf("get parser ServiceDescriptor failed")
 	}
 	inner := thrift.NewReadHTTPResponse(svcDsc)
+	inner.SetBase64Binary(c.binaryWithBase64)
 	msg.Data().(WithCodec).SetCodec(inner)
 	return c.codec.Unmarshal(ctx, msg, in)
 }
 
 func (c *httpThriftCodec) Name() string {
 	return "HttpThrift"
+}
+
+func (c *httpThriftCodec) Close() error {
+	return c.provider.Close()
 }
 
 var json = jsoniter.Config{
@@ -116,13 +128,14 @@ var json = jsoniter.Config{
 // FromHTTPRequest parse  HTTPRequest from http.Request
 func FromHTTPRequest(req *http.Request) (*HTTPRequest, error) {
 	customReq := &HTTPRequest{
-		Header:  req.Header,
-		Query:   req.URL.Query(),
-		Cookies: descriptor.Cookies{},
-		Method:  req.Method,
-		Host:    req.Host,
-		Path:    req.URL.Path,
-		Body:    map[string]interface{}{},
+		Header:      req.Header,
+		Query:       req.URL.Query(),
+		Cookies:     descriptor.Cookies{},
+		Method:      req.Method,
+		Host:        req.Host,
+		Path:        req.URL.Path,
+		ContentType: descriptor.MIMEApplicationJson,
+		Body:        map[string]interface{}{},
 	}
 	for _, cookie := range req.Cookies() {
 		customReq.Cookies[cookie.Name] = cookie.Value

@@ -44,8 +44,11 @@ type Extension interface {
 	IsRemoteClosedErr(error) bool
 }
 
-// GetReadTimeout is to make the read timeout logger, it is better for proxy case to receive error resp.
+// GetReadTimeout is to make the read timeout longer, it is better for proxy case to receive error resp.
 func GetReadTimeout(cfg rpcinfo.RPCConfig) time.Duration {
+	if cfg.RPCTimeout() <= 0 {
+		return 0
+	}
 	return cfg.RPCTimeout() + readMoreTimeout
 }
 
@@ -57,4 +60,9 @@ func GetMethodInfo(ri rpcinfo.RPCInfo, svcInfo *serviceinfo.ServiceInfo) (servic
 		return methodInfo, nil
 	}
 	return nil, remote.NewTransErrorWithMsg(remote.UnknownMethod, fmt.Sprintf("unknown method %s", methodName))
+}
+
+// MuxEnabledFlag is used to determine whether a serverHandlerFactory is multiplexing.
+type MuxEnabledFlag interface {
+	MuxEnabled() bool
 }

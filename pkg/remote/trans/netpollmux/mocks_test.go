@@ -207,6 +207,7 @@ type MockNetpollConn struct {
 	SetIdleTimeoutFunc   func(timeout time.Duration) (e error)
 	SetOnRequestFunc     func(on netpoll.OnRequest) (e error)
 	SetReadTimeoutFunc   func(timeout time.Duration) (e error)
+	SetWriteTimeoutFunc  func(timeout time.Duration) (e error)
 }
 
 // AddCloseCallback implements the netpoll.Connection interface.
@@ -265,6 +266,14 @@ func (m *MockNetpollConn) SetReadTimeout(timeout time.Duration) (e error) {
 	return
 }
 
+// SetWriteTimeout implements the netpoll.Connection interface.
+func (m *MockNetpollConn) SetWriteTimeout(timeout time.Duration) (e error) {
+	if m.SetWriteTimeoutFunc != nil {
+		return m.SetWriteTimeoutFunc(timeout)
+	}
+	return
+}
+
 // MockNetpollWriter implements netpoll.Writer
 type MockNetpollWriter struct {
 	FlushFunc       func() (err error)
@@ -297,7 +306,7 @@ func (m *MockNetpollWriter) MallocAck(n int) (err error) {
 }
 
 // Append implements the netpoll.Writer interface.
-func (m *MockNetpollWriter) Append(w netpoll.Writer) (n int, err error) {
+func (m *MockNetpollWriter) Append(w netpoll.Writer) (err error) {
 	return
 }
 
@@ -341,6 +350,11 @@ func (m *MockNetpollReader) Next(n int) (p []byte, err error) {
 
 // Peek implements the netpoll.Reader interface.
 func (m *MockNetpollReader) Peek(n int) (buf []byte, err error) {
+	return
+}
+
+// Until implements the netpoll.Reader interface.
+func (m *MockNetpollReader) Until(b byte) (buf []byte, err error) {
 	return
 }
 

@@ -15,7 +15,7 @@
  * limitations under the License.
  *
  * This file may have been modified by CloudWeGo authors. All CloudWeGo
- * Modifications are Copyright 2021 CloudWeGo Authors authors.
+ * Modifications are Copyright 2021 CloudWeGo Authors.
  */
 
 package grpc
@@ -31,16 +31,17 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/grpcframe"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
-
-	"github.com/cloudwego/netpoll"
-
-	"github.com/cloudwego/netpoll-http2"
-	"github.com/cloudwego/netpoll-http2/hpack"
+	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 const (
@@ -110,12 +111,15 @@ type parsedHeaderData struct {
 	// statusGen caches the stream status received from the trailer the server
 	// sent.  Client side only.  Do not access directly.  After all trailers are
 	// parsed, use the status method to retrieve the status.
-	statusGen *status.Status
+	statusGen    *status.Status
+	bizStatusErr kerrors.BizStatusErrorIface
 	// rawStatusCode and rawStatusMsg are set from the raw trailer fields and are not
 	// intended for direct access outside of parsing.
-	rawStatusCode *int
-	rawStatusMsg  string
-	httpStatus    *int
+	rawStatusCode  *int
+	rawStatusMsg   string
+	bizStatusCode  *int
+	bizStatusExtra map[string]string
+	httpStatus     *int
 	// Server side only fields.
 	timeoutSet bool
 	timeout    time.Duration
@@ -231,9 +235,28 @@ func contentType(contentSubtype string) string {
 func (d *decodeState) status() *status.Status {
 	if d.data.statusGen == nil {
 		// No status-details were provided; generate status using code/msg.
-		d.data.statusGen = status.New(codes.Code(int32(*(d.data.rawStatusCode))), d.data.rawStatusMsg)
+		d.data.statusGen = status.New(codes.Code(safeCastInt32(*(d.data.rawStatusCode))), d.data.rawStatusMsg)
 	}
 	return d.data.statusGen
+}
+
+func (d *decodeState) bizStatusErr() kerrors.BizStatusErrorIface {
+	if d.data.bizStatusErr == nil && d.data.bizStatusCode != nil {
+		d.data.bizStatusErr = kerrors.NewGRPCBizStatusErrorWithExtra(
+			safeCastInt32(*(d.data.bizStatusCode)), d.data.rawStatusMsg, d.data.bizStatusExtra)
+		if st, ok := d.data.bizStatusErr.(kerrors.GRPCStatusIface); ok {
+			st.SetGRPCStatus(d.status())
+		}
+	}
+	return d.data.bizStatusErr
+}
+
+// safeCastInt32 casts the number from int to int32 in safety.
+func safeCastInt32(n int) int32 {
+	if n > math.MaxInt32 || n < math.MinInt32 {
+		panic(fmt.Sprintf("Cast int to int32 failed, due to overflow, n=%d", n))
+	}
+	return int32(n)
 }
 
 const binHdrSuffix = "-bin"
@@ -265,7 +288,7 @@ func decodeMetadataHeader(k, v string) (string, error) {
 	return v, nil
 }
 
-func (d *decodeState) decodeHeader(frame *http2.MetaHeadersFrame) error {
+func (d *decodeState) decodeHeader(frame *grpcframe.MetaHeadersFrame) error {
 	// frame.Truncated is set to true when framer detects that the current header
 	// list size hits MaxHeaderListSize limit.
 	if frame.Truncated {
@@ -369,6 +392,20 @@ func (d *decodeState) processHeaderField(f hpack.HeaderField) {
 		d.data.rawStatusCode = &code
 	case "grpc-message":
 		d.data.rawStatusMsg = decodeGrpcMessage(f.Value)
+	case "biz-status":
+		code, err := strconv.Atoi(f.Value)
+		if err != nil {
+			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed biz-status: %v", err)
+			return
+		}
+		d.data.bizStatusCode = &code
+	case "biz-extra":
+		extra, err := utils.JSONStr2Map(f.Value)
+		if err != nil {
+			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed biz-extra: %v", err)
+			return
+		}
+		d.data.bizStatusExtra = extra
 	case "grpc-status-details-bin":
 		v, err := decodeBinHeader(f.Value)
 		if err != nil {
@@ -418,7 +455,7 @@ func (d *decodeState) processHeaderField(f hpack.HeaderField) {
 		}
 		v, err := decodeMetadataHeader(f.Name, f.Value)
 		if err != nil {
-			errorf("Failed to decode metadata header (%q, %q): %v", f.Name, f.Value, err)
+			klog.Errorf("Failed to decode metadata header (%q, %q): %v", f.Name, f.Value, err)
 			return
 		}
 		d.addMetadata(f.Name, v)
@@ -601,23 +638,4 @@ func decodeGrpcMessageUnchecked(msg string) string {
 		}
 	}
 	return buf.String()
-}
-
-type framer struct {
-	*http2.Framer
-	writer netpoll.Writer
-}
-
-func newFramer(conn netpoll.Connection, maxHeaderListSize uint32) *framer {
-	fr := &framer{
-		writer: conn.Writer(),
-		Framer: http2.NewFramer(conn.Writer(), conn.Reader()),
-	}
-	fr.SetMaxReadFrameSize(http2MaxFrameLen)
-	// Opt-in to Frame reuse API on framer to reduce garbage.
-	// Frames aren't safe to read from after a subsequent call to ReadFrame.
-	fr.SetReuseFrames()
-	fr.MaxHeaderListSize = maxHeaderListSize
-	fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
-	return fr
 }

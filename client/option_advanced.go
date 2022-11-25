@@ -21,6 +21,7 @@ package client
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/cloudwego/kitex/internal/client"
 	"github.com/cloudwego/kitex/pkg/acl"
@@ -57,7 +58,7 @@ func WithClientBasicInfo(ebi *rpcinfo.EndpointBasicInfo) Option {
 	}}
 }
 
-// WithDiagnosisService sets the diagnosis service for gathering debug informations.
+// WithDiagnosisService sets the diagnosis service for gathering debug information.
 func WithDiagnosisService(ds diagnosis.Service) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		o.Once.OnceOrPanic()
@@ -206,6 +207,28 @@ func WithBoundHandler(h remote.BoundHandler) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		di.Push(fmt.Sprintf("AddBoundHandler(%T)", h))
 
-		doAddBoundHandler(h, o.RemoteOpt)
+		exist := false
+		switch handler := h.(type) {
+		case remote.InboundHandler:
+			for _, inboundHandler := range o.RemoteOpt.Inbounds {
+				if reflect.DeepEqual(inboundHandler, handler) {
+					exist = true
+					break
+				}
+			}
+		case remote.OutboundHandler:
+			for _, outboundHandler := range o.RemoteOpt.Outbounds {
+				if reflect.DeepEqual(outboundHandler, handler) {
+					exist = true
+					break
+				}
+			}
+		}
+		// prevent duplication
+		if !exist {
+			o.RemoteOpt.AppendBoundHandler(h)
+		} else {
+			klog.Warnf("KITEX: BoundHandler already exists, BoundHandler=%v", h)
+		}
 	}}
 }

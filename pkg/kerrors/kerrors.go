@@ -18,6 +18,8 @@ package kerrors
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -40,6 +42,8 @@ var (
 	ErrRetry = &basicError{"retry error"}
 	// ErrRPCFinish happens when retry enabled and there is one call has finished
 	ErrRPCFinish = &basicError{"rpc call finished"}
+	// ErrRoute happens when router fail to route this call
+	ErrRoute = &basicError{"rpc route failed"}
 )
 
 // More detailed error types
@@ -54,6 +58,7 @@ var (
 	ErrNoIvkRequest         = ErrInternalException.WithCause(errors.New("invoker request not set"))
 	ErrServiceCircuitBreak  = ErrCircuitBreak.WithCause(errors.New("service circuitbreak"))
 	ErrInstanceCircuitBreak = ErrCircuitBreak.WithCause(errors.New("instance circuitbreak"))
+	ErrNoInstance           = ErrServiceDiscovery.WithCause(errors.New("no instance available"))
 )
 
 type basicError struct {
@@ -65,14 +70,19 @@ func (be *basicError) Error() string {
 	return be.message
 }
 
-// WithCause attach the given cause to current error and creates a detailed error.
+// WithCause creates a detailed error which attach the given cause to current error.
 func (be *basicError) WithCause(cause error) error {
 	return &DetailedError{basic: be, cause: cause}
 }
 
-// WithCauseAndStack attach the given cause and stack to current error.
+// WithCauseAndStack creates a detailed error which attach the given cause to current error and wrap stack.
 func (be *basicError) WithCauseAndStack(cause error, stack string) error {
 	return &DetailedError{basic: be, cause: cause, stack: stack}
+}
+
+// WithCauseAndExtraMsg creates a detailed error which attach the given cause to current error and wrap extra msg to supply error msg.
+func (be *basicError) WithCauseAndExtraMsg(cause error, extraMsg string) error {
+	return &DetailedError{basic: be, cause: cause, extraMsg: extraMsg}
 }
 
 // Timeout supports the os.IsTimeout checking.
@@ -95,6 +105,24 @@ func (de *DetailedError) Error() string {
 		return msg + ": " + de.cause.Error()
 	}
 	return msg
+}
+
+// Format the error.
+func (de *DetailedError) Format(s fmt.State, verb rune) {
+	switch verb {
+	case 'v':
+		if s.Flag('+') {
+			msg := appendErrMsg(de.basic.Error(), de.extraMsg)
+			_, _ = io.WriteString(s, msg)
+			if de.cause != nil {
+				_, _ = fmt.Fprintf(s, ": %+v", de.cause)
+			}
+			return
+		}
+		fallthrough
+	case 's', 'q':
+		_, _ = io.WriteString(s, de.Error())
+	}
 }
 
 // ErrorType returns the basic error type.
@@ -132,8 +160,8 @@ func (de *DetailedError) Stack() string {
 }
 
 // WithExtraMsg to add extra msg to supply error msg
-func (de *DetailedError) WithExtraMsg(errMsg string) {
-	de.extraMsg = errMsg
+func (de *DetailedError) WithExtraMsg(extraMsg string) {
+	de.extraMsg = extraMsg
 }
 
 func appendErrMsg(errMsg, extra string) string {

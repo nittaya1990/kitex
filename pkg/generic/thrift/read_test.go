@@ -18,22 +18,29 @@ package thrift
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/jhump/protoreflect/desc/protoparse"
 
 	"github.com/cloudwego/kitex/internal/mocks"
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
+	"github.com/cloudwego/kitex/pkg/generic/proto"
 )
 
-var stringInput = "hello world"
+var (
+	stringInput = "hello world"
+	binaryInput = []byte(stringInput)
+)
 
 func Test_nextReader(t *testing.T) {
 	type args struct {
-		tt descriptor.Type
-		t  *descriptor.TypeDescriptor
+		tt  descriptor.Type
+		t   *descriptor.TypeDescriptor
+		opt *readerOption
 	}
 	tests := []struct {
 		name    string
@@ -42,11 +49,11 @@ func Test_nextReader(t *testing.T) {
 		wantErr bool
 	}{
 		// TODO: Add test cases.
-		{"void", args{tt: descriptor.VOID, t: &descriptor.TypeDescriptor{Type: descriptor.VOID}}, readVoid, false},
+		{"void", args{tt: descriptor.VOID, t: &descriptor.TypeDescriptor{Type: descriptor.VOID}, opt: &readerOption{}}, readVoid, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := nextReader(tt.args.tt, tt.args.t)
+			got, err := nextReader(tt.args.tt, tt.args.t, tt.args.opt)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("nextReader() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -173,7 +180,7 @@ func Test_readByte(t *testing.T) {
 		wantErr bool
 	}{
 		// TODO: Add test cases.
-		{"readByte", args{in: mockTTransport, t: &descriptor.TypeDescriptor{Type: descriptor.BYTE}}, int8(1), false},
+		{"readByte", args{in: mockTTransport, t: &descriptor.TypeDescriptor{Type: descriptor.BYTE}, opt: &readerOption{}}, int8(1), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,7 +214,7 @@ func Test_readInt16(t *testing.T) {
 		wantErr bool
 	}{
 		// TODO: Add test cases.
-		{"readInt16", args{in: mockTTransport, t: &descriptor.TypeDescriptor{Type: descriptor.I16}}, int16(1), false},
+		{"readInt16", args{in: mockTTransport, t: &descriptor.TypeDescriptor{Type: descriptor.I16}, opt: &readerOption{}}, int16(1), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -302,6 +309,9 @@ func Test_readString(t *testing.T) {
 		ReadStringFunc: func() (string, error) {
 			return stringInput, nil
 		},
+		ReadBinaryFunc: func() ([]byte, error) {
+			return binaryInput, nil
+		},
 	}
 	tests := []struct {
 		name    string
@@ -315,6 +325,43 @@ func Test_readString(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := readString(context.Background(), tt.args.in, tt.args.t, tt.args.opt)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("readString() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("readString() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_readBase64String(t *testing.T) {
+	type args struct {
+		in  thrift.TProtocol
+		t   *descriptor.TypeDescriptor
+		opt *readerOption
+	}
+	mockTTransport := &mocks.MockThriftTTransport{
+		ReadStringFunc: func() (string, error) {
+			return stringInput, nil
+		},
+		ReadBinaryFunc: func() ([]byte, error) {
+			return binaryInput, nil
+		},
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    interface{}
+		wantErr bool
+	}{
+		// TODO: Add test cases.
+		{"readBase64Binary", args{in: mockTTransport, t: &descriptor.TypeDescriptor{Name: "binary", Type: descriptor.STRING}}, base64.StdEncoding.EncodeToString(binaryInput), false}, // read base64 string from binary field
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readBase64Binary(context.Background(), tt.args.in, tt.args.t, tt.args.opt)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("readString() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -392,7 +439,7 @@ func Test_readMap(t *testing.T) {
 		// TODO: Add test cases.
 		{
 			"readMap",
-			args{in: mockTTransport, t: &descriptor.TypeDescriptor{Type: descriptor.MAP, Key: &descriptor.TypeDescriptor{Type: descriptor.STRING}, Elem: &descriptor.TypeDescriptor{Type: descriptor.STRING}}},
+			args{in: mockTTransport, t: &descriptor.TypeDescriptor{Type: descriptor.MAP, Key: &descriptor.TypeDescriptor{Type: descriptor.STRING}, Elem: &descriptor.TypeDescriptor{Type: descriptor.STRING}}, opt: &readerOption{}},
 			map[interface{}]interface{}{"hello": "world"},
 			false,
 		},
@@ -535,4 +582,104 @@ func Test_readHTTPResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_readHTTPResponseWithPbBody(t *testing.T) {
+	type args struct {
+		in  thrift.TProtocol
+		t   *descriptor.TypeDescriptor
+		opt *readerOption
+	}
+	read := false
+	mockTTransport := &mocks.MockThriftTTransport{
+		ReadStructBeginFunc: func() (name string, err error) {
+			return "BizResp", nil
+		},
+		ReadFieldBeginFunc: func() (name string, typeID thrift.TType, id int16, err error) {
+			if !read {
+				read = true
+				return "", thrift.STRING, 1, nil
+			}
+			return "", thrift.STOP, 0, nil
+		},
+		ReadStringFunc: func() (string, error) {
+			return "hello world", nil
+		},
+	}
+	desc, err := getRespPbDesc()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    map[int]interface{}
+		wantErr bool
+	}{
+		// TODO: Add test cases.
+		{
+			"readHTTPResponse",
+			args{in: mockTTransport, t: &descriptor.TypeDescriptor{
+				Type: descriptor.STRUCT,
+				Struct: &descriptor.StructDescriptor{
+					FieldsByID: map[int32]*descriptor.FieldDescriptor{
+						1: {
+							ID:          1,
+							Name:        "msg",
+							Type:        &descriptor.TypeDescriptor{Type: descriptor.STRING},
+							HTTPMapping: descriptor.DefaultNewMapping("msg"),
+						},
+					},
+				},
+			}, opt: &readerOption{pbDsc: desc}},
+			map[int]interface{}{
+				1: "hello world",
+			},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readHTTPResponse(context.Background(), tt.args.in, tt.args.t, tt.args.opt)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("readHTTPResponse() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			respGot := got.(*descriptor.HTTPResponse)
+			if respGot.ContentType != descriptor.MIMEApplicationProtobuf {
+				t.Errorf("expected content type: %v, got: %v", descriptor.MIMEApplicationProtobuf, respGot.ContentType)
+			}
+			body := respGot.GeneralBody.(proto.Message)
+			for fieldID, expectedVal := range tt.want {
+				val, err := body.TryGetFieldByNumber(fieldID)
+				if err != nil {
+					t.Errorf("get by fieldID [%v] err: %v", fieldID, err)
+				}
+				if val != expectedVal {
+					t.Errorf("expected field value: %v, got: %v", expectedVal, val)
+				}
+			}
+		})
+	}
+}
+
+func getRespPbDesc() (proto.MessageDescriptor, error) {
+	path := "main.proto"
+	content := `
+	package kitex.test.server;
+
+	message BizResp {
+		optional string msg = 1;
+	}
+	`
+
+	var pbParser protoparse.Parser
+	pbParser.Accessor = protoparse.FileContentsFromMap(map[string]string{path: content})
+	fds, err := pbParser.ParseFiles(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return fds[0].GetMessageTypes()[0], nil
 }

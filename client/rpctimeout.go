@@ -23,28 +23,32 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/cloudwego/kitex/internal/wpool"
 	"github.com/cloudwego/kitex/pkg/endpoint"
-	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpctimeout"
 )
 
-func recoverFunc(ctx context.Context, logger klog.FormatLogger, ri rpcinfo.RPCInfo, done chan error) {
-	if err := recover(); err != nil {
-		e := fmt.Errorf("KITEX: panic, remote[to_service=%s|method=%s], err=%v\n%s",
-			ri.To().ServiceName(), ri.To().Method(), err, debug.Stack())
-		if l, ok := logger.(klog.CtxLogger); ok {
-			l.CtxErrorf(ctx, "%s", e.Error())
-		} else {
-			logger.Errorf("%s", e.Error())
-		}
-		rpcStats := rpcinfo.AsMutableRPCStats(ri.Stats())
-		rpcStats.SetPanicked(err)
-		done <- e
-	}
-	close(done)
+// workerPool is used to reduce the timeout goroutine overhead.
+var workerPool *wpool.Pool
+
+func init() {
+	// if timeout middleware is not enabled, it will not cause any extra overhead
+	workerPool = wpool.New(
+		128,
+		time.Minute,
+	)
+}
+
+func panicToErr(ctx context.Context, panicInfo interface{}, ri rpcinfo.RPCInfo) error {
+	e := fmt.Errorf("KITEX: panic, to_service=%s to_method=%s error=%v\nstack=%s",
+		ri.To().ServiceName(), ri.To().Method(), panicInfo, debug.Stack())
+	klog.CtxErrorf(ctx, "%s", e.Error())
+	rpcStats := rpcinfo.AsMutableRPCStats(ri.Stats())
+	rpcStats.SetPanicked(e)
+	return e
 }
 
 func makeTimeoutErr(ctx context.Context, start time.Time, timeout time.Duration) error {
@@ -78,38 +82,56 @@ func rpcTimeoutMW(mwCtx context.Context) endpoint.Middleware {
 		moreTimeout = *v
 	}
 
-	logger := mwCtx.Value(endpoint.CtxLoggerKey).(klog.FormatLogger)
 	return func(next endpoint.Endpoint) endpoint.Endpoint {
 		return func(ctx context.Context, request, response interface{}) error {
-			var err error
 			ri := rpcinfo.GetRPCInfo(ctx)
+			if ri.Config().InteractionMode() == rpcinfo.Streaming {
+				return next(ctx, request, response)
+			}
+
 			tm := ri.Config().RPCTimeout()
+			if tm > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tm+moreTimeout)
+				defer cancel()
+			}
+			// Fast path for ctx without timeout
+			if ctx.Done() == nil {
+				return next(ctx, request, response)
+			}
 
+			var err error
 			start := time.Now()
-			ctx, cancel := context.WithTimeout(ctx, tm+moreTimeout)
-			defer cancel()
-
 			done := make(chan error, 1)
-			gofunc.GoFunc(ctx, func() {
-				defer recoverFunc(ctx, logger, ri, done)
+			workerPool.GoCtx(ctx, func() {
+				defer func() {
+					if panicInfo := recover(); panicInfo != nil {
+						e := panicToErr(ctx, panicInfo, ri)
+						done <- e
+					}
+					if err == nil || !errors.Is(err, kerrors.ErrRPCFinish) {
+						// Don't regards ErrRPCFinish as normal error, it happens in retry scene,
+						// ErrRPCFinish means previous call returns first but is decoding.
+						close(done)
+					}
+				}()
 				err = next(ctx, request, response)
-				if err != nil && ctx.Err() != nil && !errors.Is(err, kerrors.ErrRPCFinish) {
-					// error occurs after the wait goroutine returns,
-					// we should log this error or it will be discarded.
-					// Specially, ErrRPCFinish can be ignored, it happens in retry scene, previous call returns first.
+				if err != nil && ctx.Err() != nil &&
+					!kerrors.IsTimeoutError(err) && !errors.Is(err, kerrors.ErrRPCFinish) {
+					// error occurs after the wait goroutine returns(RPCTimeout happens),
+					// we should log this error for troubleshooting, or it will be discarded.
+					// but ErrRPCTimeout and ErrRPCFinish can be ignored:
+					//    ErrRPCTimeout: it is same with outer timeout, here only care about non-timeout err.
+					//    ErrRPCFinish: it happens in retry scene, previous call returns first.
 					var errMsg string
 					if ri.To().Address() != nil {
-						errMsg = fmt.Sprintf("KITEX: remote[to_service=%s|method=%s|addr=%s]，err=%s",
+						errMsg = fmt.Sprintf("KITEX: to_service=%s method=%s addr=%s error=%s",
 							ri.To().ServiceName(), ri.To().Method(), ri.To().Address(), err.Error())
 					} else {
-						errMsg = fmt.Sprintf("KITEX: remote[to_service=%s|method=%s], err=%s",
+						errMsg = fmt.Sprintf("KITEX: to_service=%s method=%s error=%s",
 							ri.To().ServiceName(), ri.To().Method(), err.Error())
 					}
-					if l, ok := logger.(klog.CtxLogger); ok {
-						l.CtxErrorf(ctx, "%s", errMsg)
-					} else {
-						logger.Errorf("%s", errMsg)
-					}
+					klog.CtxErrorf(ctx, "%s", errMsg)
 				}
 			})
 

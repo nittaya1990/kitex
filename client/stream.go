@@ -19,6 +19,8 @@ package client
 import (
 	"context"
 
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
+
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/remotecli"
@@ -43,9 +45,12 @@ func (kc *kClient) Stream(ctx context.Context, method string, request, response 
 		panic("ctx is nil")
 	}
 	var ri rpcinfo.RPCInfo
-	ctx, ri = kc.initRPCInfo(ctx, method)
+	ctx, ri, _ = kc.initRPCInfo(ctx, method)
 
-	ctx = kc.opt.TracerCtl.DoStart(ctx, ri, kc.opt.Logger)
+	rpcinfo.AsMutableRPCConfig(ri.Config()).SetInteractionMode(rpcinfo.Streaming)
+	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
+
+	ctx = kc.opt.TracerCtl.DoStart(ctx, ri)
 	return kc.sEps(ctx, request, response)
 }
 
@@ -77,6 +82,26 @@ type stream struct {
 	kc     *kClient
 }
 
+func (s *stream) SetTrailer(metadata.MD) {
+	panic("this method should only be used in server side stream!")
+}
+
+func (s *stream) SetHeader(metadata.MD) error {
+	panic("this method should only be used in server side stream!")
+}
+
+func (s *stream) SendHeader(metadata.MD) error {
+	panic("this method should only be used in server side stream!")
+}
+
+func (s *stream) Header() (metadata.MD, error) {
+	return s.stream.Header()
+}
+
+func (s *stream) Trailer() metadata.MD {
+	return s.stream.Trailer()
+}
+
 func (s *stream) Context() context.Context {
 	return s.stream.Context()
 }
@@ -92,6 +117,6 @@ func (s *stream) SendMsg(m interface{}) error {
 func (s *stream) Close() error {
 	ctx := s.stream.Context()
 	ri := rpcinfo.GetRPCInfo(ctx)
-	s.kc.opt.TracerCtl.DoFinish(ctx, ri, nil, s.kc.opt.Logger)
+	s.kc.opt.TracerCtl.DoFinish(ctx, ri, nil)
 	return s.stream.Close()
 }

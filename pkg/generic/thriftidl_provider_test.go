@@ -17,7 +17,7 @@
 package generic
 
 import (
-	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cloudwego/kitex/internal/test"
@@ -60,6 +60,39 @@ func TestThriftContentWithAbsIncludePathProvider(t *testing.T) {
 	}
 	p, err := NewThriftContentWithAbsIncludePathProvider(path, includes)
 	test.Assert(t, err == nil)
+	defer p.Close()
 	tree := <-p.Provide()
-	fmt.Printf("%#v\n", tree)
+	test.Assert(t, tree != nil)
+	err = p.UpdateIDL(path, includes)
+	test.Assert(t, err == nil)
+}
+
+func TestCircularDependency(t *testing.T) {
+	main := "a.thrift"
+	content := `
+	include "b.thrift"
+	include "c.thrift" 
+
+	service a {}
+	`
+	includes := map[string]string{
+		main: content,
+		"b.thrift": `
+		include "c.thrift"
+		include "d.thrift"
+		`,
+		"c.thrift": `
+		include "d.thrift"
+		`,
+		"d.thrift": `include "a.thrift"`,
+	}
+	p, err := NewThriftContentWithAbsIncludePathProvider(main, includes)
+	test.Assert(t, err != nil && p == nil)
+	test.Assert(t, strings.HasPrefix(err.Error(), "IDL circular dependency:"))
+}
+
+func TestThriftContentProvider(t *testing.T) {
+	p, err := NewThriftContentProvider("test", nil)
+	test.Assert(t, err != nil)
+	test.Assert(t, p == nil)
 }

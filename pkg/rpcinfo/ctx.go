@@ -45,25 +45,37 @@ func GetRPCInfo(ctx context.Context) RPCInfo {
 
 // PutRPCInfo recycles the RPCInfo. This function is for internal use only.
 func PutRPCInfo(ri RPCInfo) {
+	if v, ok := ri.(internal.Reusable); ok {
+		v.Recycle()
+	}
+}
+
+// FreezeRPCInfo returns a new context containing an RPCInfo that is safe
+// to be used asynchronically.
+// Note that the RPCStats of the freezed RPCInfo will be nil and
+// the FreezeRPCInfo itself should not be used asynchronically.
+//
+// Example:
+//
+//	func (p *MyServiceImpl) MyMethod(ctx context.Context, req *MyRequest) (resp *MyResponse, err error) {
+//	    ri := rpcinfo.GetRPCInfo(ctx)
+//	    go func(ctx context.Context) {
+//	        ...
+//	        ri := rpcinfo.GetRPCInfo(ctx) // not concurrent-safe
+//	        ...
+//	    }(ctx2)
+//
+//	    ctx2 := rpcinfo.FreezeRPCInfo(ctx) // this creates a read-only copy of `ri` and attaches it to the new context
+//	    go func(ctx context.Context) {
+//	        ...
+//	        ri := rpcinfo.GetRPCInfo(ctx) // OK
+//	        ...
+//	    }(ctx2)
+//	}
+func FreezeRPCInfo(ctx context.Context) context.Context {
+	ri := GetRPCInfo(ctx)
 	if ri == nil {
-		return
+		return ctx
 	}
-	if r, ok := ri.From().(internal.Reusable); ok {
-		r.Recycle()
-	}
-	if r, ok := ri.To().(internal.Reusable); ok {
-		r.Recycle()
-	}
-	if r, ok := ri.Invocation().(internal.Reusable); ok {
-		r.Recycle()
-	}
-	if r, ok := ri.Config().(internal.Reusable); ok {
-		r.Recycle()
-	}
-	if r, ok := ri.Stats().(internal.Reusable); ok {
-		r.Recycle()
-	}
-	if r, ok := ri.(internal.Reusable); ok {
-		r.Recycle()
-	}
+	return NewCtxWithRPCInfo(ctx, freeze(ri))
 }

@@ -19,7 +19,6 @@ package event
 import (
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 const (
@@ -65,10 +64,9 @@ func (q *queue) Push(e *Event) {
 		oldV := atomic.LoadUint32(q.tailVersion[old])
 		newV := oldV + 1
 		if atomic.CompareAndSwapUint32(&q.tail, old, new) && atomic.CompareAndSwapUint32(q.tailVersion[old], oldV, newV) {
-			q.mu.RLock()
-			p := (*unsafe.Pointer)(unsafe.Pointer(&q.ring[old]))
-			atomic.StorePointer(p, unsafe.Pointer(e))
-			q.mu.RUnlock()
+			q.mu.Lock()
+			q.ring[old] = e
+			q.mu.Unlock()
 			break
 		}
 	}
@@ -77,8 +75,8 @@ func (q *queue) Push(e *Event) {
 // Dump dumps the previously pushed events out in a reversed order.
 func (q *queue) Dump() interface{} {
 	results := make([]*Event, 0, len(q.ring))
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.mu.RLock()
+	defer q.mu.RUnlock()
 	pos := int32(q.tail)
 	for i := 0; i < len(q.ring); i++ {
 		pos--

@@ -22,6 +22,7 @@ import (
 
 	stats2 "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/stats"
 )
@@ -43,7 +44,7 @@ type cliTransHandler struct {
 }
 
 // Write implements the remote.ClientTransHandler interface.
-func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (err error) {
+func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (nctx context.Context, err error) {
 	var bufWriter remote.ByteBuffer
 	stats2.Record(ctx, sendMsg.RPCInfo(), stats.WriteStart, nil)
 	defer func() {
@@ -55,13 +56,13 @@ func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remo
 	sendMsg.SetPayloadCodec(t.opt.PayloadCodec)
 	err = t.codec.Encode(ctx, sendMsg, bufWriter)
 	if err != nil {
-		return err
+		return ctx, err
 	}
-	return bufWriter.Flush()
+	return ctx, bufWriter.Flush()
 }
 
 // Read implements the remote.ClientTransHandler interface.
-func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remote.Message) (err error) {
+func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remote.Message) (nctx context.Context, err error) {
 	var bufReader remote.ByteBuffer
 	stats2.Record(ctx, recvMsg.RPCInfo(), stats.ReadStart, nil)
 	defer func() {
@@ -75,12 +76,12 @@ func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remot
 	err = t.codec.Decode(ctx, recvMsg, bufReader)
 	if err != nil {
 		if t.ext.IsTimeoutErr(err) {
-			return kerrors.ErrRPCTimeout.WithCause(err)
+			err = kerrors.ErrRPCTimeout.WithCause(err)
 		}
-		return err
+		return ctx, err
 	}
 
-	return nil
+	return ctx, nil
 }
 
 // OnMessage implements the remote.ClientTransHandler interface.
@@ -97,9 +98,9 @@ func (t *cliTransHandler) OnInactive(ctx context.Context, conn net.Conn) {
 // OnError implements the remote.ClientTransHandler interface.
 func (t *cliTransHandler) OnError(ctx context.Context, err error, conn net.Conn) {
 	if pe, ok := err.(*kerrors.DetailedError); ok {
-		t.opt.Logger.Errorf("KITEX: send request error, remote=%s, err=%s\n%s", conn.RemoteAddr(), err.Error(), pe.Stack())
+		klog.CtxErrorf(ctx, "KITEX: send request error, remote=%s, error=%s\nstack=%s", conn.RemoteAddr(), err.Error(), pe.Stack())
 	} else {
-		t.opt.Logger.Errorf("KITEX: send request error, remote=%s, err=%s", conn.RemoteAddr(), err.Error())
+		klog.CtxErrorf(ctx, "KITEX: send request error, remote=%s, error=%s", conn.RemoteAddr(), err.Error())
 	}
 }
 

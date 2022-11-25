@@ -18,11 +18,14 @@ package nphttp2
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"time"
 
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
@@ -33,14 +36,45 @@ type clientConn struct {
 	s  *grpc.Stream
 }
 
-var _ net.Conn = (*clientConn)(nil)
+var _ GRPCConn = (*clientConn)(nil)
+
+func (c *clientConn) ReadFrame() (hdr, data []byte, err error) {
+	hdr = make([]byte, 5)
+	_, err = c.Read(hdr)
+	if err != nil {
+		return nil, nil, err
+	}
+	dLen := int(binary.BigEndian.Uint32(hdr[1:]))
+	data = make([]byte, dLen)
+	_, err = c.Read(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return hdr, data, nil
+}
 
 func newClientConn(ctx context.Context, tr grpc.ClientTransport, addr string) (*clientConn, error) {
 	ri := rpcinfo.GetRPCInfo(ctx)
+	var svcName string
+	if ri.Invocation().PackageName() == "" {
+		svcName = ri.Invocation().ServiceName()
+	} else {
+		svcName = fmt.Sprintf("%s.%s", ri.Invocation().PackageName(), ri.Invocation().ServiceName())
+	}
+
+	host := ri.To().ServiceName()
+	if rawURL, ok := ri.To().Tag(rpcinfo.HTTPURL); ok {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, err
+		}
+		host = u.Host
+	}
+
 	s, err := tr.NewStream(ctx, &grpc.CallHdr{
-		Host: ri.To().ServiceName(),
+		Host: host,
 		// grpc method format /package.Service/Method
-		Method: fmt.Sprintf("/%s.%s/%s", ri.Invocation().PackageName(), ri.Invocation().ServiceName(), ri.Invocation().MethodName()),
+		Method: fmt.Sprintf("/%s/%s", svcName, ri.Invocation().MethodName()),
 	})
 	if err != nil {
 		return nil, err
@@ -55,19 +89,32 @@ func newClientConn(ctx context.Context, tr grpc.ClientTransport, addr string) (*
 func (c *clientConn) Read(b []byte) (n int, err error) {
 	n, err = c.s.Read(b)
 	if err == io.EOF {
-		if statusErr := c.s.Status().Err(); statusErr != nil {
-			err = statusErr
+		if status := c.s.Status(); status.Code() != codes.OK {
+			if bizStatusErr := c.s.BizStatusErr(); bizStatusErr != nil {
+				err = bizStatusErr
+			} else {
+				err = status.Err()
+			}
 		}
 	}
-	return n, convertErrorFromGrpcToKitex(err)
+	return n, err
 }
 
 func (c *clientConn) Write(b []byte) (n int, err error) {
 	if len(b) < 5 {
 		return 0, io.ErrShortWrite
 	}
-	err = c.tr.Write(c.s, b[:5], b[5:], &grpc.Options{})
-	return len(b), convertErrorFromGrpcToKitex(err)
+	return c.WriteFrame(b[:5], b[5:])
+}
+
+func (c *clientConn) WriteFrame(hdr, data []byte) (n int, err error) {
+	grpcConnOpt := &grpc.Options{}
+	// When there's no more data frame, add END_STREAM flag to this empty frame.
+	if hdr == nil && data == nil {
+		grpcConnOpt.Last = true
+	}
+	err = c.tr.Write(c.s, hdr, data, grpcConnOpt)
+	return len(hdr) + len(data), err
 }
 
 func (c *clientConn) LocalAddr() net.Addr                { return c.tr.LocalAddr() }

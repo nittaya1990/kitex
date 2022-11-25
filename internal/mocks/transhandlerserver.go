@@ -21,6 +21,7 @@ import (
 	"net"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
@@ -46,13 +47,12 @@ type MockSvrTransHandler struct {
 
 	OnReadFunc func(ctx context.Context, conn net.Conn) error
 
-	WriteFunc func(ctx context.Context, conn net.Conn, send remote.Message) error
+	WriteFunc func(ctx context.Context, conn net.Conn, send remote.Message) (nctx context.Context, err error)
 
-	// 调用decode
-	ReadFunc func(ctx context.Context, conn net.Conn, msg remote.Message) error
+	ReadFunc func(ctx context.Context, conn net.Conn, msg remote.Message) (nctx context.Context, err error)
 }
 
-// OnRead .
+// OnRead implements the remote.TransHandler interface.
 func (t *MockSvrTransHandler) OnRead(ctx context.Context, conn net.Conn) (err error) {
 	if t.OnReadFunc != nil {
 		return t.OnReadFunc(ctx, conn)
@@ -60,48 +60,49 @@ func (t *MockSvrTransHandler) OnRead(ctx context.Context, conn net.Conn) (err er
 	return
 }
 
-func (t *MockSvrTransHandler) Write(ctx context.Context, conn net.Conn, send remote.Message) (err error) {
+// Write implements the remote.TransHandler interface.
+func (t *MockSvrTransHandler) Write(ctx context.Context, conn net.Conn, send remote.Message) (nctx context.Context, err error) {
 	if t.WriteFunc != nil {
 		return t.WriteFunc(ctx, conn, send)
 	}
 	return
 }
 
-// Read 阻塞等待
-func (t *MockSvrTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) (err error) {
+// Read implements the remote.TransHandler interface.
+func (t *MockSvrTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) (nctx context.Context, err error) {
 	if t.ReadFunc != nil {
 		return t.ReadFunc(ctx, conn, msg)
 	}
 	return
 }
 
-// OnMessage .
+// OnMessage implements the remote.TransHandler interface.
 func (t *MockSvrTransHandler) OnMessage(ctx context.Context, args, result remote.Message) (context.Context, error) {
 	// do nothing
 	return ctx, nil
 }
 
-// OnActive 新连接建立时触发，主要用于服务端，对用netpoll onPrepare
+// OnActive implements the remote.TransHandler interface.
 func (t *MockSvrTransHandler) OnActive(ctx context.Context, conn net.Conn) (context.Context, error) {
 	// ineffective now and do nothing
 	return ctx, nil
 }
 
-// OnInactive 连接关闭时回调
+// OnInactive implements the remote.TransHandler interface.
 func (t *MockSvrTransHandler) OnInactive(ctx context.Context, conn net.Conn) {
 	// ineffective now and do nothing
 }
 
-// OnError 传输层扩展中panic 回调
+// OnError implements the remote.TransHandler interface.
 func (t *MockSvrTransHandler) OnError(ctx context.Context, err error, conn net.Conn) {
 	if pe, ok := err.(*kerrors.DetailedError); ok {
-		t.Opt.Logger.Errorf("KITEX: send request error, remote=%s, err=%s\n%s", conn.RemoteAddr(), err.Error(), pe.Stack())
+		klog.CtxErrorf(ctx, "KITEX: send request error, remote=%s, error=%s\nstack=%s", conn.RemoteAddr(), err.Error(), pe.Stack())
 	} else {
-		t.Opt.Logger.Errorf("KITEX: send request error, remote=%s, err=%s", conn.RemoteAddr(), err.Error())
+		klog.CtxErrorf(ctx, "KITEX: send request error, remote=%s, error=%s", conn.RemoteAddr(), err.Error())
 	}
 }
 
-// SetPipeline .
+// SetPipeline implements the remote.TransHandler interface.
 func (t *MockSvrTransHandler) SetPipeline(p *remote.TransPipeline) {
 	t.transPipe = p
 }
@@ -129,7 +130,7 @@ type MockTransServer struct {
 	transHdlr remote.ServerTransHandler
 
 	CreateListenerFunc  func(net.Addr) (net.Listener, error)
-	BootstrapServerFunc func() (err error)
+	BootstrapServerFunc func(net.Listener) (err error)
 	ShutdownFunc        func() (err error)
 	ConnCountFunc       func() utils.AtomicInt
 }
@@ -143,9 +144,9 @@ func (t *MockTransServer) CreateListener(addr net.Addr) (ln net.Listener, err er
 }
 
 // BootstrapServer .
-func (t *MockTransServer) BootstrapServer() (err error) {
+func (t *MockTransServer) BootstrapServer(ln net.Listener) (err error) {
 	if t.BootstrapServerFunc != nil {
-		return t.BootstrapServerFunc()
+		return t.BootstrapServerFunc(ln)
 	}
 	return
 }

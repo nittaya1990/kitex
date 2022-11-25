@@ -19,9 +19,13 @@ package rpcinfo
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/cloudwego/kitex/pkg/kerrors"
 )
 
 var (
+	_              Invocation       = (*invocation)(nil)
+	_              InvocationSetter = (*invocation)(nil)
 	invocationPool sync.Pool
 	globalSeqID    int32 = 0
 )
@@ -36,6 +40,8 @@ type InvocationSetter interface {
 	SetServiceName(name string)
 	SetMethodName(name string)
 	SetSeqID(seqID int32)
+	SetBizStatusErr(err kerrors.BizStatusErrorIface)
+	Reset()
 }
 
 type invocation struct {
@@ -43,10 +49,11 @@ type invocation struct {
 	serviceName string
 	methodName  string
 	seqID       int32
+	bizErr      kerrors.BizStatusErrorIface
 }
 
 // NewInvocation creates a new Invocation with the given service, method and optional package.
-func NewInvocation(service, method string, pkgOpt ...string) Invocation {
+func NewInvocation(service, method string, pkgOpt ...string) *invocation {
 	ivk := invocationPool.Get().(*invocation)
 	ivk.seqID = genSeqID()
 	ivk.serviceName = service
@@ -113,6 +120,21 @@ func (i *invocation) SetMethodName(name string) {
 	i.methodName = name
 }
 
+// BizStatusErr implements the Invocation interface.
+func (i *invocation) BizStatusErr() kerrors.BizStatusErrorIface {
+	return i.bizErr
+}
+
+// SetBizStatusErr implements the InvocationSetter interface.
+func (i *invocation) SetBizStatusErr(err kerrors.BizStatusErrorIface) {
+	i.bizErr = err
+}
+
+// Reset implements the InvocationSetter interface.
+func (i *invocation) Reset() {
+	i.zero()
+}
+
 // Recycle reuses the invocation.
 func (i *invocation) Recycle() {
 	i.zero()
@@ -121,6 +143,8 @@ func (i *invocation) Recycle() {
 
 func (i *invocation) zero() {
 	i.seqID = 0
+	i.packageName = ""
 	i.serviceName = ""
 	i.methodName = ""
+	i.bizErr = nil
 }

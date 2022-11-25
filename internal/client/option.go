@@ -30,22 +30,23 @@ import (
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/event"
 	"github.com/cloudwego/kitex/pkg/http"
-	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/loadbalance"
 	"github.com/cloudwego/kitex/pkg/loadbalance/lbcache"
 	"github.com/cloudwego/kitex/pkg/proxy"
 	"github.com/cloudwego/kitex/pkg/remote"
-	"github.com/cloudwego/kitex/pkg/remote/codec"
 	"github.com/cloudwego/kitex/pkg/remote/codec/protobuf"
 	"github.com/cloudwego/kitex/pkg/remote/codec/thrift"
 	"github.com/cloudwego/kitex/pkg/remote/connpool"
-	"github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/retry"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/pkg/utils"
+	"github.com/cloudwego/kitex/pkg/warmup"
+	"github.com/cloudwego/kitex/transport"
 )
 
 func init() {
@@ -74,7 +75,6 @@ type Options struct {
 	Targets          string
 	CBSuite          *circuitbreak.CBSuite
 	Timeouts         rpcinfo.TimeoutProvider
-	CheckRPCTimeout  bool
 
 	ACLRules []acl.RejectFunc
 
@@ -90,15 +90,24 @@ type Options struct {
 	DebugService diagnosis.Service
 
 	// Observability
-	Logger     klog.FormatLogger
 	TracerCtl  *internal_stats.Controller
 	StatsLevel *stats.Level
 
 	// retry policy
-	RetryPolicy    *retry.Policy
-	RetryContainer *retry.Container
+	RetryMethodPolicies map[string]retry.Policy
+	RetryContainer      *retry.Container
+	RetryWithResult     *retry.ShouldResultRetry
 
 	CloseCallbacks []func() error
+	WarmUpOption   *warmup.ClientOption
+
+	// GRPC
+	GRPCConnPoolSize uint32
+	GRPCConnectOpts  *grpc.ConnectOptions
+
+	// XDS
+	XDSEnabled          bool
+	XDSRouterMiddleware endpoint.Middleware
 }
 
 // Apply applies all options.
@@ -118,11 +127,10 @@ func NewOptions(opts []Option) *Options {
 	o := &Options{
 		Cli:          &rpcinfo.EndpointBasicInfo{Tags: make(map[string]string)},
 		Svr:          &rpcinfo.EndpointBasicInfo{Tags: make(map[string]string)},
-		RemoteOpt:    newClientOption(),
+		RemoteOpt:    newClientRemoteOption(),
 		Configs:      rpcinfo.NewRPCConfig(),
 		Locks:        NewConfigLocks(),
 		Once:         configutil.NewOptionOnce(),
-		Logger:       klog.DefaultLogger(),
 		HTTPResolver: http.NewDefaultResolver(),
 		DebugService: diagnosis.NoopService,
 
@@ -130,11 +138,13 @@ func NewOptions(opts []Option) *Options {
 		Events: event.NewQueue(event.MaxEventNum),
 
 		TracerCtl: &internal_stats.Controller{},
+
+		GRPCConnectOpts: new(grpc.ConnectOptions),
 	}
 	o.Apply(opts)
 	o.MetaHandlers = append(o.MetaHandlers, transmeta.MetainfoClientHandler)
 
-	o.initConnectionPool()
+	o.initRemoteOpt()
 
 	if o.RetryContainer != nil && o.DebugService != nil {
 		o.DebugService.RegisterProbeFunc(diagnosis.RetryPolicyKey, o.RetryContainer.Dump)
@@ -150,10 +160,19 @@ func NewOptions(opts []Option) *Options {
 	return o
 }
 
-func (o *Options) initConnectionPool() {
+func (o *Options) initRemoteOpt() {
+	var zero connpool2.IdleConfig
+
+	if o.Configs.TransportProtocol()&transport.GRPC == transport.GRPC {
+		if o.PoolCfg != nil && *o.PoolCfg == zero {
+			// grpc unary short connection
+			o.GRPCConnectOpts.ShortConn = true
+		}
+		o.RemoteOpt.ConnPool = nphttp2.NewConnPool(o.Svr.ServiceName, o.GRPCConnPoolSize, *o.GRPCConnectOpts)
+		o.RemoteOpt.CliHandlerFactory = nphttp2.NewCliTransHandlerFactory()
+	}
 	if o.RemoteOpt.ConnPool == nil {
 		if o.PoolCfg != nil {
-			var zero connpool2.IdleConfig
 			if *o.PoolCfg == zero {
 				o.RemoteOpt.ConnPool = connpool.NewShortPool(o.Svr.ServiceName)
 			} else {
@@ -169,36 +188,5 @@ func (o *Options) initConnectionPool() {
 				},
 			)
 		}
-	}
-	pool := o.RemoteOpt.ConnPool
-	o.CloseCallbacks = append(o.CloseCallbacks, pool.Close)
-
-	if df, ok := pool.(interface{ Dump() interface{} }); ok {
-		o.DebugService.RegisterProbeFunc(diagnosis.ConnPoolKey, df.Dump)
-	}
-	if r, ok := pool.(remote.ConnPoolReporter); ok && o.RemoteOpt.EnableConnPoolReporter {
-		r.EnableReporter()
-	}
-
-	if long, ok := pool.(remote.LongConnPool); ok {
-		o.Bus.Watch(discovery.ChangeEventName, func(ev *event.Event) {
-			ch, ok := ev.Extra.(*discovery.Change)
-			if !ok {
-				return
-			}
-			for _, inst := range ch.Removed {
-				if addr := inst.Address(); addr != nil {
-					long.Clean(addr.Network(), addr.String())
-				}
-			}
-		})
-	}
-}
-
-func newClientOption() *remote.ClientOption {
-	return &remote.ClientOption{
-		CliHandlerFactory: netpoll.NewCliTransHandlerFactory(),
-		Dialer:            netpoll.NewDialer(),
-		Codec:             codec.NewDefaultCodec(),
 	}
 }

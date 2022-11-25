@@ -1,5 +1,16 @@
 # CloudWeGo-Kitex
+
 English | [中文](README_cn.md)
+
+[![Release](https://img.shields.io/github/v/release/cloudwego/kitex)](https://github.com/cloudwego/kitex/releases)
+[![WebSite](https://img.shields.io/website?up_message=cloudwego&url=https%3A%2F%2Fwww.cloudwego.io%2F)](https://www.cloudwego.io/)
+[![License](https://img.shields.io/github/license/cloudwego/kitex)](https://github.com/cloudwego/kitex/blob/main/LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cloudwego/kitex)](https://goreportcard.com/report/github.com/cloudwego/kitex)
+[![OpenIssue](https://img.shields.io/github/issues/cloudwego/kitex)](https://github.com/cloudwego/kitex/issues)
+[![ClosedIssue](https://img.shields.io/github/issues-closed/cloudwego/kitex)](https://github.com/cloudwego/kitex/issues?q=is%3Aissue+is%3Aclosed)
+![Stars](https://img.shields.io/github/stars/cloudwego/kitex)
+![Forks](https://img.shields.io/github/forks/cloudwego/kitex)
+[![Slack](https://img.shields.io/badge/slack-join_chat-success.svg?logo=slack)](https://cloudwego.slack.com/join/shared_invite/zt-tmcbzewn-UjXMF3ZQsPhl7W3tEDZboA)
 
 Kitex [kaɪt'eks] is a **high-performance** and **strong-extensibility** Golang RPC framework that helps developers build microservices. If the performance and extensibility are the main concerns when you develop microservices, Kitex can be a good choice.
 
@@ -35,64 +46,43 @@ Kitex has built-in code generation tools that support generating **Thrift**, **P
 
 ## Documentation
 
-- [**Getting Started**](https://www.cloudwego.io/docs/getting-started/)
+- [**Getting Started**](https://www.cloudwego.io/docs/kitex/getting-started/)
 
 - **User Guide**
 
   - **Basic Features**
   
-    Including Message Type, Supported Protocols, Directly Invoke, Connection Pool, Timeout Control, Request Retry, LoadBalancer, Circuit Breaker, Rate Limiting, Instrumentation Control, Logging and HttpResolver, [learn more](https://www.cloudwego.io/docs/tutorials/basic-feature/)
+    Including Message Type, Supported Protocols, Directly Invoke, Connection Pool, Timeout Control, Request Retry, LoadBalancer, Circuit Breaker, Rate Limiting, Instrumentation Control, Logging and HttpResolver.[[more]](https://www.cloudwego.io/docs/tutorials/basic-feature/)
     
   - **Governance Features**
   
-    Supporting Service Discovery, Monitoring, Tracing and Customized Access Control, [learn more](https://www.cloudwego.io/docs/tutorials/service-governance/)
+    Supporting Service Discovery, Monitoring, Tracing and Customized Access Control.[[more]](https://www.cloudwego.io/docs/kitex/tutorials/service-governance/)
     
   - **Advanced Features**
   
-    Supporting Generic Call and Server SDK Mode, [learn more](https://www.cloudwego.io/docs/tutorials/advanced-feature/)
+    Supporting Generic Call and Server SDK Mode.[[more]](https://www.cloudwego.io/docs/kitex/tutorials/advanced-feature/)
     
   - **Code Generation**
   
-    Including Code Generation Tool and Combined Service, [learn more](https://www.cloudwego.io/docs/tutorials/code-gen/)
+    Including Code Generation Tool and Combined Service.[[more]](https://www.cloudwego.io/docs/kitex/tutorials/code-gen/)
     
   - **Framework Extension**
   
-    Providing Middleware Extensions, Suite Extensions, Service Registry, Service Discovery, Customize LoadBalancer, Monitoring, Logging, Codec, Transport Module, Transport Pipeline, Metadata Transparent Transmission, Diagnosis Module, [learn more](https://www.cloudwego.io/docs/tutorials/framework-exten/)
-    
+    Providing Middleware Extensions, Suite Extensions, Service Registry, Service Discovery, Customize LoadBalancer, Monitoring, Logging, Codec, Transport Module, Transport Pipeline, Metadata Transparent Transmission, Diagnosis Module.[[more]](https://www.cloudwego.io/docs/kitex/tutorials/framework-exten/)
+  
 - **Reference**
 
-  - For Transport Protocol, Exception Instruction and Version Specification, please refer to [doc](https://www.cloudwego.io/docs/reference/)
-    
+  - For Transport Protocol, Exception Instruction and Version Specification, please refer to [doc](https://www.cloudwego.io/docs/kitex/reference/).
+  
 - **FAQ**
+
+  - Please refer to [FAQ](https://www.cloudwego.io/docs/kitex/faq/).
 
 ## Performance
 
-We compared the performance of Kitex with some popular RPC frameworks ([benchmark](https://github.com/cloudwego/kitex-benchmark)), such as [gRPC](https://github.com/grpc/grpc) and [RPCX](https://github.com/smallnest/rpcx), both using Protobuf. The test results show that [Kitex](https://github.com/cloudwego/kitex) performs better.
+Performance benchmark can only provide limited reference. In production, there are many factors can affect actual performance.
 
-*Note: The performance benchmarks obtained from the experiment are for reference only, because there are many factors that can affect the actual performance in application scenarios.*
-
-### Test Environment
-
-- CPU: Intel(R) Xeon(R) Gold 5118 CPU @ 2.30GHz, 4 cores
-- Memory: 8GB
-- OS: Debian 5.4.56.bsk.1-amd64 x86_64 GNU/Linux
-- Go: 1.15.4
-
-### Concurrency Performance 
-
-Change the concurrency with a fixed packet size 1KB.
-
-QPS|TP99|TP999
-----|----|----
-| ![image](docs/images/performance_concurrent_qps.png) | ![image](docs/images/performance_concurrent_tp99.png) | ![image](docs/images/performance_concurrent_tp999.png) |
-
-### Throughput Performance
-
-Change packet size with a fixed concurrency of 100.
-
-QPS|TP99|TP999
-----|----|----
-|![image](docs/images/performance_bodysize_qps.png) | ![image](docs/images/performance_bodysize_tp99.png) | ![image](docs/images/performance_bodysize_tp999.png) |
+We provide the [kitex-benchmark](https://github.com/cloudwego/kitex-benchmark) project to track and compare the performance of Kitex and other frameworks under different conditions for reference.
 
 ## Related Projects
 
@@ -102,8 +92,9 @@ QPS|TP99|TP999
 
 ## Blogs
 
-- [Performance Optimization Practice of Go RPC framework Kitex](https://www.cloudwego.io/zh/blog/2021/09/23/%E5%AD%97%E8%8A%82%E8%B7%B3%E5%8A%A8-go-rpc-%E6%A1%86%E6%9E%B6-kitex-%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96%E5%AE%9E%E8%B7%B5/)
-- [Practice of ByteDance on Go Network Library](https://mp.weixin.qq.com/s?__biz=MzI1MzYzMjE0MQ==&mid=2247485756&idx=1&sn=4d2712e4bfb9be27a790fa15159a7be1&chksm=e9d0c2dedea74bc8179af39888a5b2b99266587cad32744ad11092b91ec2e2babc74e69090e6&scene=21#wechat_redirect)
+- [Performance Optimization on Kitex](https://www.cloudwego.io/blog/2021/09/23/performance-optimization-on-kitex/)
+- [ByteDance Practice on Go Network Library](https://www.cloudwego.io/blog/2021/10/09/bytedance-practices-on-go-network-library/)
+- [Getting Started With Kitex's Practice: Performance Testing Guide](https://www.cloudwego.io/blog/2021/11/24/getting-started-with-kitexs-practice-performance-testing-guide/)
 
 ## Contributing
 
@@ -115,10 +106,15 @@ Kitex is distributed under the [Apache License, version 2.0](https://github.com/
 
 ## Community
 - Email: [conduct@cloudwego.io](conduct@cloudwego.io)
+- How to become a member: [COMMUNITY MEMBERSHIP](https://github.com/cloudwego/community/blob/main/COMMUNITY_MEMBERSHIP.md)
 - Issues: [Issues](https://github.com/cloudwego/kitex/issues)
+- Slack: Join our CloudWeGo community [Slack Channel](https://join.slack.com/t/cloudwego/shared_invite/zt-tmcbzewn-UjXMF3ZQsPhl7W3tEDZboA).
 - Lark: Scan the QR code below with [Lark](https://www.larksuite.com/zh_cn/download) to join our CloudWeGo/kitex user group.
 
-  ![LarkGroup](docs/images/lark_group.png)
+  ![LarkGroup](images/lark_group.png)
+- Wechat: CloudWeGo community wechat group.
+
+  ![WechatGroup](images/wechat_group_cn.png)
 
 ## Landscapes
 

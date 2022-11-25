@@ -230,14 +230,14 @@ func (b *netpollByteBuffer) NewBuffer() remote.ByteBuffer {
 }
 
 // AppendBuffer appends buf to the original buffer.
-func (b *netpollByteBuffer) AppendBuffer(buf remote.ByteBuffer) (n int, err error) {
+func (b *netpollByteBuffer) AppendBuffer(buf remote.ByteBuffer) (err error) {
 	subBuf := buf.(*netpollByteBuffer)
-	n, err = b.writer.Append(subBuf.writer)
+	err = b.writer.Append(subBuf.writer)
 	buf.Release(nil)
 	return
 }
 
-// Bytes is not supported in netpoll bytebuf.
+// Bytes are not supported in netpoll bytebuf.
 func (b *netpollByteBuffer) Bytes() (buf []byte, err error) {
 	return nil, errors.New("method Bytes() not support in netpoll bytebuf")
 }

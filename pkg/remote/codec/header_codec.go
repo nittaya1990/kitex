@@ -25,7 +25,11 @@ import (
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/codec/perrors"
+	"github.com/cloudwego/kitex/pkg/remote/transmeta"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
+	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
+	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 /**
@@ -94,10 +98,11 @@ type ProtocolID uint8
 
 // Supported ProtocolID values.
 const (
-	ProtocolIDThriftBinary  ProtocolID = 0x00
-	ProtocolIDThriftCompact ProtocolID = 0x02
-	ProtocolIDProtobufKitex ProtocolID = 0x03
-	ProtocolIDDefault                  = ProtocolIDThriftBinary
+	ProtocolIDThriftBinary    ProtocolID = 0x00
+	ProtocolIDThriftCompact   ProtocolID = 0x02 // Kitex not support
+	ProtocolIDThriftCompactV2 ProtocolID = 0x03 // Kitex not support
+	ProtocolIDKitexProtobuf   ProtocolID = 0x04
+	ProtocolIDDefault                    = ProtocolIDThriftBinary
 )
 
 type InfoIDType uint8 // uint8
@@ -163,7 +168,7 @@ func (t ttHeader) decode(ctx context.Context, message remote.Message, in remote.
 
 	seqID := Bytes2Uint32NoCheck(headerMeta[Size32*2 : Size32*3])
 	if err = SetOrCheckSeqID(int32(seqID), message); err != nil {
-		klog.Warnf("the seqID in TTHeader check failed, err=%s", err.Error())
+		klog.Warnf("the seqID in TTHeader check failed, error=%s", err.Error())
 		// some framework doesn't write correct seqID in TTheader, to ignore err only check it in payload
 		// print log to push the downstream framework to refine it.
 	}
@@ -176,7 +181,7 @@ func (t ttHeader) decode(ctx context.Context, message remote.Message, in remote.
 	if headerInfo, err = in.Next(int(headerInfoSize)); err != nil {
 		return perrors.NewProtocolError(err)
 	}
-	if err = checkProtocalID(headerInfo[0], message); err != nil {
+	if err = checkProtocolID(headerInfo[0], message); err != nil {
 		return err
 	}
 	hdIdx := 2
@@ -191,8 +196,10 @@ func (t ttHeader) decode(ctx context.Context, message remote.Message, in remote.
 	}
 
 	if err := readKVInfo(hdIdx, headerInfo, message); err != nil {
-		return perrors.NewProtocolErrorWithMsg(fmt.Sprintf("ttTHeader read kv info failed, %s", err.Error()))
+		return perrors.NewProtocolErrorWithMsg(fmt.Sprintf("ttHeader read kv info failed, %s", err.Error()))
 	}
+	fillBasicInfoOfTTHeader(message)
+
 	message.SetPayloadLen(int(totalLen - uint32(headerInfoSize) + Size32 - TTHeaderMetaSize))
 	return err
 }
@@ -376,20 +383,25 @@ func setFlags(flags uint16, message remote.Message) {
 func getProtocolID(pi remote.ProtocolInfo) ProtocolID {
 	switch pi.CodecType {
 	case serviceinfo.Protobuf:
-		return ProtocolIDProtobufKitex
+		// ProtocolIDKitexProtobuf is 0x03 at old version(<=v1.9.1) , but it conflicts with ThriftCompactV2.
+		// Change the ProtocolIDKitexProtobuf to 0x04 from v1.9.2. But notice! that it is an incompatible change of protocol.
+		// For keeping compatible, Kitex use ProtocolIDDefault send ttheader+KitexProtobuf request to ignore the old version
+		// check failed if use 0x04. It doesn't make sense, but it won't affect the correctness of RPC call because the actual
+		// protocol check at checkPayload func which check payload with HEADER MAGIC bytes of payload.
+		return ProtocolIDDefault
 	}
 	return ProtocolIDDefault
 }
 
 // protoID just for ttheader
-func checkProtocalID(protoID uint8, message remote.Message) error {
+func checkProtocolID(protoID uint8, message remote.Message) error {
 	switch protoID {
-	case uint8(ProtocolIDProtobufKitex):
-		// rpcCfg := internal.AsMutableRPCConfig(message.RPCInfo().Config())
-		// rpcCfg.SetCodecType(kitex.TTHeaderProtobufKitex)
 	case uint8(ProtocolIDThriftBinary):
+	case uint8(ProtocolIDKitexProtobuf):
+	case uint8(ProtocolIDThriftCompactV2):
+		// just for compatibility
 	default:
-		return fmt.Errorf("unsupport ProtocolID[%d]", protoID)
+		return fmt.Errorf("unsupported ProtocolID[%d]", protoID)
 	}
 	return nil
 }
@@ -433,4 +445,29 @@ func (m meshHeader) decode(ctx context.Context, message remote.Message, in remot
 		return perrors.NewProtocolErrorWithMsg(fmt.Sprintf("meshHeader read kv info failed, %s", err.Error()))
 	}
 	return nil
+}
+
+// Fill basic from_info(from service, from address) which carried by ttheader to rpcinfo.
+// It is better to fill rpcinfo in matahandlers in terms of design,
+// but metahandlers are executed after payloadDecode, we don't know from_info when error happen in payloadDecode.
+// So 'fillBasicInfoOfTTHeader' is just for getting more info to output log when decode error happen.
+func fillBasicInfoOfTTHeader(msg remote.Message) {
+	if msg.RPCRole() == remote.Server {
+		fi := rpcinfo.AsMutableEndpointInfo(msg.RPCInfo().From())
+		if fi != nil {
+			if v := msg.TransInfo().TransStrInfo()[transmeta.HeaderTransRemoteAddr]; v != "" {
+				fi.SetAddress(utils.NewNetAddr("tcp", v))
+			}
+			if v := msg.TransInfo().TransIntInfo()[transmeta.FromService]; v != "" {
+				fi.SetServiceName(v)
+			}
+		}
+	} else {
+		ti := remoteinfo.AsRemoteInfo(msg.RPCInfo().To())
+		if ti != nil {
+			if v := msg.TransInfo().TransStrInfo()[transmeta.HeaderTransRemoteAddr]; v != "" {
+				ti.SetRemoteAddr(utils.NewNetAddr("tcp", v))
+			}
+		}
+	}
 }

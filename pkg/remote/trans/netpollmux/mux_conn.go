@@ -20,34 +20,46 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 
 	"github.com/cloudwego/netpoll"
+	"github.com/cloudwego/netpoll/mux"
 
-	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/remote/codec"
 	np "github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
+	"github.com/cloudwego/kitex/pkg/remote/transmeta"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
 )
 
+// ErrConnClosed .
 var ErrConnClosed = errors.New("conn closed")
 
-var SharedSize int32 = 32
+var defaultCodec = codec.NewDefaultCodec()
 
 func newMuxCliConn(connection netpoll.Connection) *muxCliConn {
 	c := &muxCliConn{
 		muxConn:  newMuxConn(connection),
-		seqIDMap: newSharedMap(SharedSize),
+		seqIDMap: newShardMap(mux.ShardSize),
 	}
 	connection.SetOnRequest(c.OnRequest)
+	connection.AddCloseCallback(func(connection netpoll.Connection) error {
+		return c.forceClose()
+	})
 	return c
 }
 
 type muxCliConn struct {
 	muxConn
-	seqIDMap *sharedMap // (k,v) is (sequenceID, notify)
-	logger   klog.FormatLogger
+	closing  bool      // whether the server is going to close this connection
+	seqIDMap *shardMap // (k,v) is (sequenceID, notify)
+}
+
+func (c *muxCliConn) IsActive() bool {
+	return !c.closing && c.muxConn.IsActive()
 }
 
 // OnRequest is called when the connection creates.
@@ -56,24 +68,44 @@ func (c *muxCliConn) OnRequest(ctx context.Context, connection netpoll.Connectio
 	length, seqID, err := parseHeader(connection.Reader())
 	if err != nil {
 		err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
-		return c.onError(err, connection)
-	}
-	asyncCallback, ok := c.seqIDMap.load(seqID)
-	if !ok {
-		connection.Reader().Skip(length)
-		connection.Reader().Release()
-		return
+		return c.onError(ctx, err, connection)
 	}
 	// reader is nil if return error
 	reader, err := connection.Reader().Slice(length)
 	if err != nil {
 		err = fmt.Errorf("mux read package slice failed: addr(%s), %w", connection.RemoteAddr(), err)
-		return c.onError(err, connection)
+		return c.onError(ctx, err, connection)
 	}
-	gofunc.GoFunc(ctx, func() {
+	// seqId == 0 means a control frame.
+	if seqID == 0 {
+		iv := rpcinfo.NewInvocation("none", "none")
+		iv.SetSeqID(0)
+		ri := rpcinfo.NewRPCInfo(nil, nil, iv, nil, nil)
+		ctl := NewControlFrame()
+		msg := remote.NewMessage(ctl, nil, ri, remote.Reply, remote.Client)
+
+		bufReader := np.NewReaderByteBuffer(reader)
+		if err = defaultCodec.Decode(ctx, msg, bufReader); err != nil {
+			return
+		}
+
+		crrst := msg.TransInfo().TransStrInfo()[transmeta.HeaderConnectionReadyToReset]
+		if len(crrst) > 0 {
+			// the server is closing this connection
+			c.closing = true
+			reader.(io.Closer).Close()
+		}
+		return
+	}
+	go func() {
+		asyncCallback, ok := c.seqIDMap.load(seqID)
+		if !ok {
+			reader.(io.Closer).Close()
+			return
+		}
 		bufReader := np.NewReaderByteBuffer(reader)
 		asyncCallback.Recv(bufReader, nil)
-	})
+	}()
 	return nil
 }
 
@@ -82,7 +114,7 @@ func (c *muxCliConn) Close() error {
 	return nil
 }
 
-func (c *muxCliConn) close() error {
+func (c *muxCliConn) forceClose() error {
 	c.Connection.Close()
 	c.seqIDMap.rangeMap(func(seqID int32, msg EventHandler) {
 		msg.Recv(nil, ErrConnClosed)
@@ -90,8 +122,15 @@ func (c *muxCliConn) close() error {
 	return nil
 }
 
-func (c *muxCliConn) onError(err error, connection netpoll.Connection) error {
-	c.logger.Errorf("KITEX: %s", err.Error())
+func (c *muxCliConn) close() error {
+	if !c.closing {
+		return c.forceClose()
+	}
+	return nil
+}
+
+func (c *muxCliConn) onError(ctx context.Context, err error, connection netpoll.Connection) error {
+	klog.CtxErrorf(ctx, "KITEX: error=%s", err.Error())
 	connection.Close()
 	return err
 }
@@ -106,34 +145,13 @@ func newMuxSvrConn(connection netpoll.Connection, pool *sync.Pool) *muxSvrConn {
 
 type muxSvrConn struct {
 	muxConn
-	pool *sync.Pool // ctx with rpcInfo
+	pool *sync.Pool // pool of rpcInfo
 }
 
 func newMuxConn(connection netpoll.Connection) muxConn {
 	c := muxConn{}
 	c.Connection = connection
-	writer := np.NewWriterByteBuffer(connection.Writer())
-	c.sharedQueue = newSharedQueue(SharedSize, func(gts []BufferGetter) {
-		var err error
-		var buf remote.ByteBuffer
-		var isNil bool
-		for _, gt := range gts {
-			buf, isNil = gt()
-			if !isNil {
-				_, err = writer.AppendBuffer(buf)
-				if err != nil {
-					connection.Close()
-					return
-				}
-			}
-		}
-	}, func() {
-		err := writer.Flush()
-		if err != nil {
-			connection.Close()
-			return
-		}
-	})
+	c.shardQueue = mux.NewShardQueue(mux.ShardSize, connection)
 	return c
 }
 
@@ -143,11 +161,11 @@ var (
 )
 
 type muxConn struct {
-	netpoll.Connection              // raw conn
-	sharedQueue        *sharedQueue // use for write
+	netpoll.Connection                 // raw conn
+	shardQueue         *mux.ShardQueue // use for write
 }
 
 // Put puts the buffer getter back to the queue.
-func (c *muxConn) Put(gt BufferGetter) {
-	c.sharedQueue.Add(gt)
+func (c *muxConn) Put(gt mux.WriterGetter) {
+	c.shardQueue.Add(gt)
 }

@@ -15,7 +15,7 @@
  * limitations under the License.
  *
  * This file may have been modified by CloudWeGo authors. All CloudWeGo
- * Modifications are Copyright 2021 CloudWeGo Authors authors.
+ * Modifications are Copyright 2021 CloudWeGo Authors.
  */
 
 package grpc
@@ -27,8 +27,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/cloudwego/netpoll-http2"
-	"github.com/cloudwego/netpoll-http2/hpack"
+	"github.com/bytedance/gopkg/lang/mcache"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+
+	"github.com/cloudwego/kitex/pkg/klog"
 )
 
 var updateHeaderTblSize = func(e *hpack.Encoder, v uint32) {
@@ -133,8 +136,13 @@ func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Resu
 type dataFrame struct {
 	streamID  uint32
 	endStream bool
-	h         []byte
-	d         []byte
+	// h is optional, d is required.
+	// you can assign the header to h and the payload to the d;
+	// or just assign the header + payload together to the d.
+	// In other words, h = nil means d = header + payload.
+	h      []byte
+	d      []byte
+	dcache []byte // dcache is the origin d created by mcache, this ptr is only used for kitex
 	// onEachWrite is called every time
 	// a part of d is written out.
 	onEachWrite func()
@@ -499,14 +507,14 @@ const minBatchSize = 1000
 // When there's no more control frames to read from controlBuf, loopy flushes the write buffer.
 // As an optimization, to increase the batch size for each flush, loopy yields the processor, once
 // if the batch size is too low to give stream goroutines a chance to fill it up.
-func (l *loopyWriter) run() (err error) {
+func (l *loopyWriter) run(remoteAddr string) (err error) {
 	defer func() {
 		if err == ErrConnClosing {
 			// Don't log ErrConnClosing as error since it happens
 			// 1. When the connection is closed by some other known issue.
 			// 2. User closed the connection.
 			// 3. A graceful close of connection.
-			infof("transport: loopyWriter.run returning. %v", err)
+			klog.Debugf("KITEX: grpc transport loopyWriter.run returning, error=%v, remoteAddr=%s", err, remoteAddr)
 			err = nil
 		}
 	}()
@@ -546,7 +554,7 @@ func (l *loopyWriter) run() (err error) {
 			}
 			if gosched {
 				gosched = false
-				if l.framer.writer.MallocLen() < minBatchSize {
+				if l.framer.writer.offset < minBatchSize {
 					runtime.Gosched()
 					continue hasdata
 				}
@@ -605,7 +613,7 @@ func (l *loopyWriter) headerHandler(h *headerFrame) error {
 	if l.side == serverSide {
 		str, ok := l.estdStreams[h.streamID]
 		if !ok {
-			warningf("transport: loopy doesn't recognize the stream: %d", h.streamID)
+			klog.Warnf("transport: loopy doesn't recognize the stream: %d", h.streamID)
 			return nil
 		}
 		// Case 1.A: Server is responding back with headers.
@@ -658,7 +666,7 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 	l.hBuf.Reset()
 	for _, f := range hf {
 		if err := l.hEnc.WriteField(f); err != nil {
-			warningf("transport: loopyWriter.writeHeader encountered error while encoding headers:", err)
+			klog.Warnf("transport: loopyWriter.writeHeader encountered error while encoding headers:", err)
 		}
 	}
 	var (
@@ -831,9 +839,9 @@ func (l *loopyWriter) processData() (bool, error) {
 	dataItem := str.itl.peek().(*dataFrame) // Peek at the first data item this stream.
 	// A data item is represented by a dataFrame, since it later translates into
 	// multiple HTTP2 data frames.
-	// Every dataFrame has two buffers; h that keeps grpc-message header and d that is acutal data.
+	// Every dataFrame has two buffers; h that keeps grpc-message header and d that is actual data.
 	// As an optimization to keep wire traffic low, data from d is copied to h to make as big as the
-	// maximum possilbe HTTP2 frame size.
+	// maximum possible HTTP2 frame size.
 
 	if len(dataItem.h) == 0 && len(dataItem.d) == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
@@ -906,6 +914,9 @@ func (l *loopyWriter) processData() (bool, error) {
 	dataItem.d = dataItem.d[dSize:]
 
 	if len(dataItem.h) == 0 && len(dataItem.d) == 0 { // All the data from that message was written out.
+		if len(dataItem.dcache) > 0 {
+			mcache.Free(dataItem.dcache)
+		}
 		str.itl.dequeue()
 	}
 	if str.itl.isEmpty() {

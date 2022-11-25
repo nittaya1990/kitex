@@ -18,11 +18,10 @@ package remotesvr
 
 import (
 	"net"
-	"os"
 	"sync"
-	"syscall"
 
 	"github.com/cloudwego/kitex/pkg/endpoint"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 )
 
@@ -66,21 +65,20 @@ func (s *server) Start() chan error {
 	s.listener = ln
 	s.Unlock()
 
-	go func() { errCh <- s.transSvr.BootstrapServer() }()
+	go func() { errCh <- s.transSvr.BootstrapServer(ln) }()
 	return errCh
 }
 
 func (s *server) buildListener() (ln net.Listener, err error) {
-	addr := s.opt.Address
-	if addr.Network() == "unix" {
-		syscall.Unlink(addr.String())
-		os.Chmod(addr.String(), os.ModePerm)
+	if s.opt.Listener != nil {
+		klog.Infof("KITEX: server listen at addr=%s", s.opt.Listener.Addr().String())
+		return s.opt.Listener, nil
 	}
-
+	addr := s.opt.Address
 	if ln, err = s.transSvr.CreateListener(addr); err != nil {
-		s.opt.Logger.Errorf("KITEX: server listen at %s failed, err=%v", addr.String(), err)
+		klog.Errorf("KITEX: server listen failed, addr=%s error=%s", addr.String(), err)
 	} else {
-		s.opt.Logger.Infof("KITEX: server listen at %s", ln.Addr().String())
+		klog.Infof("KITEX: server listen at addr=%s", ln.Addr().String())
 	}
 	return
 }

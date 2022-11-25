@@ -21,6 +21,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/transport"
 )
@@ -37,13 +38,11 @@ type EndpointInfo interface {
 // RPCStats is used to collect statistics about the RPC.
 type RPCStats interface {
 	Record(ctx context.Context, event stats.Event, status stats.Status, info string)
-
 	SendSize() uint64
 	RecvSize() uint64
 	Error() error
 	Panicked() (bool, interface{})
 	GetEvent(event stats.Event) Event
-
 	Level() stats.Level
 }
 
@@ -73,6 +72,7 @@ type RPCConfig interface {
 	Timeouts
 	IOBufferSize() int
 	TransportProtocol() transport.Protocol
+	InteractionMode() InteractionMode
 }
 
 // Invocation contains specific information about the call.
@@ -81,6 +81,7 @@ type Invocation interface {
 	ServiceName() string
 	MethodName() string
 	SeqID() int32
+	BizStatusErr() kerrors.BizStatusErrorIface
 }
 
 // RPCInfo is the core abstraction of information about an RPC in Kitex.

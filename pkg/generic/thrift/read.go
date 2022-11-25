@@ -18,11 +18,17 @@ package thrift
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 
 	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/jhump/protoreflect/desc"
+
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
+	"github.com/cloudwego/kitex/pkg/generic/proto"
 )
+
+var emptyPbDsc = &desc.MessageDescriptor{}
 
 type readerOption struct {
 	// result will be encode to json, so map[interface{}]interface{} will not be valid
@@ -31,12 +37,30 @@ type readerOption struct {
 	// return exception as error
 	throwException bool
 	// read http response
-	http bool
+	http             bool
+	binaryWithBase64 bool
+	// describe struct of current level
+	pbDsc proto.MessageDescriptor
 }
 
 type reader func(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error)
 
-func nextReader(tt descriptor.Type, t *descriptor.TypeDescriptor) (reader, error) {
+type fieldSetter func(field *descriptor.FieldDescriptor, val interface{}) error
+
+func getMapFieldSetter(st map[string]interface{}) fieldSetter {
+	return func(field *descriptor.FieldDescriptor, val interface{}) error {
+		st[field.FieldName()] = val
+		return nil
+	}
+}
+
+func getPbFieldSetter(st proto.Message) fieldSetter {
+	return func(field *descriptor.FieldDescriptor, val interface{}) error {
+		return st.TrySetFieldByNumber(int(field.ID), val)
+	}
+}
+
+func nextReader(tt descriptor.Type, t *descriptor.TypeDescriptor, opt *readerOption) (reader, error) {
 	if err := assertType(tt, t.Type); err != nil {
 		return nil, err
 	}
@@ -52,6 +76,9 @@ func nextReader(tt descriptor.Type, t *descriptor.TypeDescriptor) (reader, error
 	case descriptor.I64:
 		return readInt64, nil
 	case descriptor.STRING:
+		if t.Name == "binary" && opt.binaryWithBase64 {
+			return readBase64Binary, nil
+		}
 		return readString, nil
 	case descriptor.DOUBLE:
 		return readDouble, nil
@@ -94,7 +121,7 @@ func skipStructReader(ctx context.Context, in thrift.TProtocol, t *descriptor.Ty
 			}
 		} else {
 			_fieldType := descriptor.FromThriftTType(fieldType)
-			reader, err := nextReader(_fieldType, field.Type)
+			reader, err := nextReader(_fieldType, field.Type, opt)
 			if err != nil {
 				return nil, fmt.Errorf("nextReader of %s/%s/%d error %w", structName, fieldName, fieldID, err)
 			}
@@ -136,11 +163,25 @@ func readBool(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescri
 }
 
 func readByte(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
-	return in.ReadByte()
+	res, err := in.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if opt.pbDsc != nil {
+		return int32(res), nil
+	}
+	return res, nil
 }
 
 func readInt16(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
-	return in.ReadI16()
+	res, err := in.ReadI16()
+	if err != nil {
+		return nil, err
+	}
+	if opt.pbDsc != nil {
+		return int32(res), nil
+	}
+	return res, nil
 }
 
 func readInt32(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
@@ -155,13 +196,21 @@ func readString(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDesc
 	return in.ReadString()
 }
 
+func readBase64Binary(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
+	bytes, err := in.ReadBinary()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(bytes), nil
+}
+
 func readList(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
 	elemType, length, err := in.ReadListBegin()
 	if err != nil {
 		return nil, err
 	}
 	_elemType := descriptor.FromThriftTType(elemType)
-	reader, err := nextReader(_elemType, t.Elem)
+	reader, err := nextReader(_elemType, t.Elem, opt)
 	if err != nil {
 		return nil, err
 	}
@@ -193,24 +242,28 @@ func readInterfaceMap(ctx context.Context, in thrift.TProtocol, t *descriptor.Ty
 		return m, nil
 	}
 	_keyType := descriptor.FromThriftTType(keyType)
-	keyReader, err := nextReader(_keyType, t.Key)
+	keyReader, err := nextReader(_keyType, t.Key, opt)
 	if err != nil {
 		return nil, err
 	}
 	_elemType := descriptor.FromThriftTType(elemType)
-	elemReader, err := nextReader(_elemType, t.Elem)
+	elemReader, err := nextReader(_elemType, t.Elem, opt)
 	if err != nil {
 		return nil, err
 	}
 	for i := 0; i < length; i++ {
+		nest := unnestPb(opt, 1)
 		key, err := keyReader(ctx, in, t.Key, opt)
 		if err != nil {
 			return nil, err
 		}
+		nest()
+		nest = unnestPb(opt, 2)
 		elem, err := elemReader(ctx, in, t.Elem, opt)
 		if err != nil {
 			return nil, err
 		}
+		nest()
 		m[key] = elem
 	}
 	return m, in.ReadMapEnd()
@@ -226,12 +279,12 @@ func readStringMap(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeD
 		return m, nil
 	}
 	_keyType := descriptor.FromThriftTType(keyType)
-	keyReader, err := nextReader(_keyType, t.Key)
+	keyReader, err := nextReader(_keyType, t.Key, opt)
 	if err != nil {
 		return nil, err
 	}
 	_elemType := descriptor.FromThriftTType(elemType)
-	elemReader, err := nextReader(_elemType, t.Elem)
+	elemReader, err := nextReader(_elemType, t.Elem, opt)
 	if err != nil {
 		return nil, err
 	}
@@ -250,8 +303,39 @@ func readStringMap(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeD
 }
 
 func readStruct(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
-	st := map[string]interface{}{}
-	_, err := in.ReadStructBegin()
+	var fs fieldSetter
+	var st interface{}
+	if opt == nil || opt.pbDsc == nil {
+		if opt == nil {
+			opt = &readerOption{}
+		}
+		holder := map[string]interface{}{}
+		fs = getMapFieldSetter(holder)
+		st = holder
+	} else {
+		holder := proto.NewMessage(opt.pbDsc)
+		fs = getPbFieldSetter(holder)
+		st = holder
+	}
+
+	var err error
+	// set default value
+	// void is nil struct
+	// default value with struct NOT SUPPORT pb.
+	if t.Struct != nil {
+		for _, field := range t.Struct.DefaultFields {
+			val := field.DefaultValue
+			if field.ValueMapping != nil {
+				if val, err = field.ValueMapping.Response(ctx, val, field); err != nil {
+					return nil, err
+				}
+			}
+			if err := fs(field, val); err != nil {
+				return nil, err
+			}
+		}
+	}
+	_, err = in.ReadStructBegin()
 	if err != nil {
 		return nil, err
 	}
@@ -281,8 +365,9 @@ func readStruct(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDesc
 				return nil, err
 			}
 		} else {
+			nest := unnestPb(opt, field.ID)
 			_fieldType := descriptor.FromThriftTType(fieldType)
-			reader, err := nextReader(_fieldType, field.Type)
+			reader, err := nextReader(_fieldType, field.Type, opt)
 			if err != nil {
 				return nil, fmt.Errorf("nextReader of %s/%s/%d error %w", t.Name, field.Name, fieldID, err)
 			}
@@ -295,7 +380,11 @@ func readStruct(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDesc
 					return nil, err
 				}
 			}
-			st[field.FieldName()] = val
+			nest()
+
+			if err := fs(field, val); err != nil {
+				return nil, err
+			}
 		}
 		if err := in.ReadFieldEnd(); err != nil {
 			return nil, err
@@ -305,8 +394,31 @@ func readStruct(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDesc
 }
 
 func readHTTPResponse(ctx context.Context, in thrift.TProtocol, t *descriptor.TypeDescriptor, opt *readerOption) (interface{}, error) {
-	resp := descriptor.NewHTTPResponse()
-	_, err := in.ReadStructBegin()
+	var resp *descriptor.HTTPResponse
+	if opt == nil || opt.pbDsc == nil {
+		if opt == nil {
+			opt = &readerOption{}
+		}
+		resp = descriptor.NewHTTPResponse()
+	} else {
+		resp = descriptor.NewHTTPPbResponse(proto.NewMessage(opt.pbDsc))
+	}
+
+	var err error
+	// set default value
+	// default value with struct NOT SUPPORT pb.
+	for _, field := range t.Struct.DefaultFields {
+		val := field.DefaultValue
+		if field.ValueMapping != nil {
+			if val, err = field.ValueMapping.Response(ctx, val, field); err != nil {
+				return nil, err
+			}
+		}
+		if err = field.HTTPMapping.Response(ctx, resp, field, val); err != nil {
+			return nil, err
+		}
+	}
+	_, err = in.ReadStructBegin()
 	if err != nil {
 		return nil, err
 	}
@@ -333,9 +445,12 @@ func readHTTPResponse(ctx context.Context, in thrift.TProtocol, t *descriptor.Ty
 				return nil, err
 			}
 		} else {
+			// Replace pb descriptor with field type
+			nest := unnestPb(opt, field.ID)
+
 			// check required
 			_fieldType := descriptor.FromThriftTType(fieldType)
-			reader, err := nextReader(_fieldType, field.Type)
+			reader, err := nextReader(_fieldType, field.Type, opt)
 			if err != nil {
 				return nil, fmt.Errorf("nextReader of %s/%s/%d error %w", t.Name, field.Name, fieldID, err)
 			}
@@ -348,6 +463,7 @@ func readHTTPResponse(ctx context.Context, in thrift.TProtocol, t *descriptor.Ty
 					return nil, err
 				}
 			}
+			nest()
 			if err = field.HTTPMapping.Response(ctx, resp, field, val); err != nil {
 				return nil, err
 			}
@@ -356,5 +472,20 @@ func readHTTPResponse(ctx context.Context, in thrift.TProtocol, t *descriptor.Ty
 			return nil, err
 		}
 		readFields[int32(fieldID)] = struct{}{}
+	}
+}
+
+func unnestPb(opt *readerOption, fieldId int32) func() {
+	pbDsc := opt.pbDsc
+	if pbDsc != nil {
+		fd := opt.pbDsc.FindFieldByNumber(fieldId)
+		if fd != nil && fd.GetMessageType() != nil {
+			opt.pbDsc = fd.GetMessageType()
+		} else {
+			opt.pbDsc = emptyPbDsc
+		}
+	}
+	return func() {
+		opt.pbDsc = pbDsc
 	}
 }

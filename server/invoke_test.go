@@ -17,6 +17,8 @@
 package server
 
 import (
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apache/thrift/lib/go/thrift"
@@ -27,10 +29,13 @@ import (
 	"github.com/cloudwego/kitex/pkg/utils"
 )
 
+// TestInvokerCall tests Invoker, call Kitex server just like SDK.
 func TestInvokerCall(t *testing.T) {
-	var opts []Option
-	opts = append(opts, WithMetaHandler(noopMetahandler{}))
-	invoker := NewInvoker(opts...)
+	var gotErr atomic.Value
+	invoker := NewInvoker(WithMetaHandler(noopMetahandler{}), WithErrorHandler(func(err error) error {
+		gotErr.Store(err)
+		return err
+	}))
 
 	err := invoker.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 	if err != nil {
@@ -40,13 +45,15 @@ func TestInvokerCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	args := mocks.NewMockArgs()
 	codec := utils.NewThriftMessageCodec()
+
+	// call success
 	b, _ := codec.Encode("mock", thrift.CALL, 0, args.(thrift.TStruct))
-
 	msg := invoke.NewMessage(nil, nil)
-	msg.SetRequestBytes(b)
-
+	err = msg.SetRequestBytes(b)
+	test.Assert(t, err == nil)
 	err = invoker.Call(msg)
 	if err != nil {
 		t.Fatal(err)
@@ -56,4 +63,28 @@ func TestInvokerCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	test.Assert(t, len(b) > 0)
+	test.Assert(t, gotErr.Load() == nil)
+
+	// call fails
+	b, _ = codec.Encode("mockError", thrift.CALL, 0, args.(thrift.TStruct))
+	msg = invoke.NewMessage(nil, nil)
+	err = msg.SetRequestBytes(b)
+	test.Assert(t, err == nil)
+	err = invoker.Call(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	test.Assert(t, strings.Contains(gotErr.Load().(error).Error(), "mockError"))
+}
+
+// TestInvokerInit test invoker init without service info, should fail
+func TestInvokerInit(t *testing.T) {
+	// test init without register server info
+	invoker := NewInvoker()
+	err := invoker.Init()
+	test.Assert(t, err != nil)
+	test.Assert(t, strings.Contains(err.Error(), "run: no service. Use RegisterService to set one"))
+
+	err = invoker.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+	test.Assert(t, err == nil)
 }

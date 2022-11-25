@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Package lbcache combine balancer with reslover and cache the resolve result
+// Package lbcache combine balancer with resolver and cache the resolve result
 package lbcache
 
 import (
@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/cloudwego/kitex/pkg/diagnosis"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/loadbalance"
@@ -50,6 +51,9 @@ type Options struct {
 	// Balancer expire check interval
 	// we need remove idle Balancers for resource saving
 	ExpireInterval time.Duration
+
+	// DiagnosisService is used register info for diagnosis
+	DiagnosisService diagnosis.Service
 }
 
 func (v *Options) check() {
@@ -72,7 +76,7 @@ type Hookable interface {
 }
 
 // BalancerFactory get or create a balancer with given target
-// if has the same key(reslover.Target(target)), we will cache and reuse the Balance
+// if it has the same key(reslover.Target(target)), we will cache and reuse the Balance
 type BalancerFactory struct {
 	Hookable
 	opts       Options
@@ -156,11 +160,9 @@ func (b *BalancerFactory) Get(ctx context.Context, target rpcinfo.EndpointInfo) 
 			b:      b,
 			target: desc,
 		}
-		// store the res when init
 		bl.res.Store(res)
-		b.cache.Store(desc, bl)
-		// add self into sharedTicker
 		bl.sharedTicker = getSharedTicker(bl, b.opts.RefreshInterval)
+		b.cache.Store(desc, bl)
 		return bl, nil
 	})
 	if err != nil {
@@ -182,7 +184,7 @@ type Balancer struct {
 func (bl *Balancer) refresh() {
 	res, err := bl.b.resolver.Resolve(context.Background(), bl.target)
 	if err != nil {
-		klog.Warnf("[resolver] refresh key: %s error: %s", bl.target, err)
+		klog.Warnf("KITEX: resolver refresh failed, key=%s error=%s", bl.target, err.Error())
 		return
 	}
 	renameResultCacheKey(&res, bl.b.resolver.Name())
@@ -194,6 +196,14 @@ func (bl *Balancer) refresh() {
 	}
 	// replace previous result
 	bl.res.Store(res)
+}
+
+// GetResult returns the discovery result that the Balancer holds.
+func (bl *Balancer) GetResult() (res discovery.Result, ok bool) {
+	if v := bl.res.Load(); v != nil {
+		return v.(discovery.Result), true
+	}
+	return
 }
 
 // GetPicker equal to loadbalance.Balancer without pass discovery.Result, because we cache the result
@@ -216,4 +226,44 @@ func (bl *Balancer) close() {
 	}
 	// delete from sharedTicker
 	bl.sharedTicker.delete(bl)
+}
+
+const unknown = "unknown"
+
+func Dump() interface{} {
+	type instInfo struct {
+		Address string
+		Weight  int
+	}
+	cacheDump := make(map[string]interface{})
+	balancerFactories.Range(func(key, val interface{}) bool {
+		cacheKey := key.(string)
+		if bf, ok := val.(*BalancerFactory); ok {
+			routeMap := make(map[string]interface{})
+			cacheDump[cacheKey] = routeMap
+			bf.cache.Range(func(k, v interface{}) bool {
+				routeKey := k.(string)
+				if bl, ok := v.(*Balancer); ok {
+					if dr, ok := bl.res.Load().(discovery.Result); ok {
+						insts := make([]instInfo, 0, len(dr.Instances))
+						for i := range dr.Instances {
+							inst := dr.Instances[i]
+							addr := fmt.Sprintf("%s://%s", inst.Address().Network(), inst.Address().String())
+							insts = append(insts, instInfo{Address: addr, Weight: inst.Weight()})
+						}
+						routeMap[routeKey] = insts
+					} else {
+						routeMap[routeKey] = unknown
+					}
+				} else {
+					routeMap[routeKey] = unknown
+				}
+				return true
+			})
+		} else {
+			cacheDump[cacheKey] = unknown
+		}
+		return true
+	})
+	return cacheDump
 }

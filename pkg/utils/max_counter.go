@@ -18,7 +18,7 @@ package utils
 
 import "sync/atomic"
 
-// MaxCounter is a integer counter with upper limit.
+// MaxCounter is an integer counter with upper limit.
 type MaxCounter struct {
 	now int64
 	max int
@@ -40,7 +40,16 @@ func (cl *MaxCounter) Inc() bool {
 	return true
 }
 
-// Dec decrease the counter by one.
+// Dec decreases the counter by one.
 func (cl *MaxCounter) Dec() {
 	atomic.AddInt64(&cl.now, -1)
+}
+
+// DecN decreases the counter by n.
+func (cl *MaxCounter) DecN(n int64) {
+	atomic.AddInt64(&cl.now, -n)
+}
+
+func (cl *MaxCounter) Now() int64 {
+	return atomic.LoadInt64(&cl.now)
 }

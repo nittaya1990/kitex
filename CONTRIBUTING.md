@@ -3,15 +3,12 @@
 ## Your First Pull Request
 We use github for our codebase. You can start by reading [How To Pull Request](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests).
 
-## Without Semantic Versioning
-We keep the stable code in branch `main` like `golang.org/x`. Development base on branch `develop`. And we promise the **Forward Compatibility** by adding new package directory with suffix `v2/v3` when code has break changes.
-
 ## Branch Organization
 We use [git-flow](https://nvie.com/posts/a-successful-git-branching-model/) as our branch organization, as known as [FDD](https://en.wikipedia.org/wiki/Feature-driven_development)
 
 ## Bugs
 ### 1. How to Find Known Issues
-We are using [Github Issues](https://github.com/cloudwego/kitex/issues) for our public bugs. We keep a close eye on this and try to make it clear when we have an internal fix in progress. Before filing a new task, try to make sure your problem doesn’t already exist.
+We are using [Github Issues](https://github.com/cloudwego/kitex/issues) for our public bugs. We keep a close eye on this and try to make it clear when we have an internal fix in progress. Before filing a new task, try to make sure your problem doesn't already exist.
 
 ### 2. Reporting New Issues
 Providing a reduced test code is a recommended way for reporting issues. Then can placed in:

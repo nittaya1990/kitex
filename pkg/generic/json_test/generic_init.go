@@ -19,6 +19,8 @@ package test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -30,7 +32,6 @@ import (
 	kt "github.com/cloudwego/kitex/internal/mocks/thrift"
 	"github.com/cloudwego/kitex/pkg/generic"
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
-	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/server"
@@ -57,7 +58,6 @@ func newGenericServer(g generic.Generic, addr net.Addr, handler generic.Service)
 	go func() {
 		err := svr.Run()
 		if err != nil {
-			klog.Errorf("addr=%v bind failed. %s", addr, err)
 			panic(err)
 		}
 	}()
@@ -125,6 +125,30 @@ func (g *GenericServiceReadRequiredFiledImpl) GenericCall(ctx context.Context, m
 	return `{"Msg":"world"}`, nil
 }
 
+// GenericServiceReadRequiredFiledImpl ...
+type GenericServiceBinaryEchoImpl struct{}
+
+const mockMyMsg = "my msg"
+
+type BinaryEcho struct {
+	Msg       string `json:"msg"`
+	GotBase64 bool   `json:"got_base64"`
+}
+
+// GenericCall ...
+func (g *GenericServiceBinaryEchoImpl) GenericCall(ctx context.Context, method string, request interface{}) (response interface{}, err error) {
+	req := &BinaryEcho{}
+	json.Unmarshal([]byte(request.(string)), req)
+	fmt.Printf("Recv: %s\n", req.Msg)
+	if !req.GotBase64 && req.Msg != mockMyMsg {
+		return nil, errors.New("call failed, msg type mismatch")
+	}
+	if req.GotBase64 && req.Msg != base64.StdEncoding.EncodeToString([]byte(mockMyMsg)) {
+		return nil, errors.New("call failed, incorrect base64 data")
+	}
+	return request, nil
+}
+
 var (
 	mockReq  = `{"Msg":"hello","strMap":{"mk1":"mv1","mk2":"mv2"},"strList":["lv1","lv2"]} `
 	mockResp = "this is response"
@@ -143,7 +167,6 @@ func newMockServer(handler kt.Mock, addr net.Addr, opts ...server.Option) server
 	go func() {
 		err := svr.Run()
 		if err != nil {
-			klog.Errorf("addr=%v bind failed. %s", addr, err)
 			panic(err)
 		}
 	}()

@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
-	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
@@ -39,14 +38,12 @@ func init() {
 type ConnWrapper struct {
 	connPool remote.ConnPool
 	conn     net.Conn
-	logger   klog.FormatLogger
 }
 
 // NewConnWrapper returns a new ConnWrapper using the given connPool and logger.
-func NewConnWrapper(connPool remote.ConnPool, logger klog.FormatLogger) *ConnWrapper {
+func NewConnWrapper(connPool remote.ConnPool) *ConnWrapper {
 	cm := connWrapperPool.Get().(*ConnWrapper)
 	cm.connPool = connPool
-	cm.logger = logger
 	return cm
 }
 
@@ -55,12 +52,12 @@ func (cm *ConnWrapper) GetConn(ctx context.Context, d remote.Dialer, ri rpcinfo.
 	configs := ri.Config()
 	timeout := configs.ConnectTimeout()
 	if cm.connPool != nil {
-		longConn, err := cm.getConnWithPool(ctx, cm.connPool, d, timeout, ri)
+		conn, err := cm.getConnWithPool(ctx, cm.connPool, d, timeout, ri)
 		if err != nil {
 			return nil, err
 		}
-		cm.conn = longConn
-		if raw, ok := longConn.(remote.RawConn); ok {
+		cm.conn = conn
+		if raw, ok := conn.(remote.RawConn); ok {
 			rawConn := raw.RawConn()
 			return rawConn, nil
 		}
@@ -80,11 +77,12 @@ func (cm *ConnWrapper) ReleaseConn(err error, ri rpcinfo.RPCInfo) {
 	}
 	if cm.connPool != nil {
 		if err == nil {
-			if _, ok := ri.To().Tag(rpcinfo.ConnResetTag); ok {
+			_, ok := ri.To().Tag(rpcinfo.ConnResetTag)
+			if ok || ri.Config().InteractionMode() == rpcinfo.Oneway {
 				cm.connPool.Discard(cm.conn)
-				cm.logger.Debugf("discarding the connection because peer will shutdown later")
+			} else {
+				cm.connPool.Put(cm.conn)
 			}
-			cm.connPool.Put(cm.conn)
 		} else {
 			cm.connPool.Discard(cm.conn)
 		}
@@ -106,24 +104,26 @@ func (cm *ConnWrapper) zero() {
 }
 
 func (cm *ConnWrapper) getConnWithPool(ctx context.Context, cp remote.ConnPool, d remote.Dialer,
-	timeout time.Duration, ri rpcinfo.RPCInfo) (net.Conn, error) {
+	timeout time.Duration, ri rpcinfo.RPCInfo,
+) (net.Conn, error) {
 	addr := ri.To().Address()
 	if addr == nil {
 		return nil, kerrors.ErrNoDestAddress
 	}
-	opt := &remote.ConnOption{Dialer: d, ConnectTimeout: timeout}
+	opt := remote.ConnOption{Dialer: d, ConnectTimeout: timeout}
 	ri.Stats().Record(ctx, stats.ClientConnStart, stats.StatusInfo, "")
-	longConn, err := cp.Get(ctx, addr.Network(), addr.String(), opt)
+	conn, err := cp.Get(ctx, addr.Network(), addr.String(), opt)
 	if err != nil {
 		ri.Stats().Record(ctx, stats.ClientConnFinish, stats.StatusError, err.Error())
 		return nil, kerrors.ErrGetConnection.WithCause(err)
 	}
 	ri.Stats().Record(ctx, stats.ClientConnFinish, stats.StatusInfo, "")
-	return longConn, nil
+	return conn, nil
 }
 
 func (cm *ConnWrapper) getConnWithDialer(ctx context.Context, d remote.Dialer,
-	timeout time.Duration, ri rpcinfo.RPCInfo) (net.Conn, error) {
+	timeout time.Duration, ri rpcinfo.RPCInfo,
+) (net.Conn, error) {
 	addr := ri.To().Address()
 	if addr == nil {
 		return nil, kerrors.ErrNoDestAddress

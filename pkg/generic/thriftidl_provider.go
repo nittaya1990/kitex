@@ -19,6 +19,7 @@ package generic
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/cloudwego/thriftgo/parser"
 
@@ -26,8 +27,14 @@ import (
 	"github.com/cloudwego/kitex/pkg/generic/thrift"
 )
 
+var (
+	_ Closer = &ThriftContentProvider{}
+	_ Closer = &ThriftContentWithAbsIncludePathProvider{}
+)
+
 type thriftFileProvider struct {
-	svcs chan *descriptor.ServiceDescriptor
+	closeOnce sync.Once
+	svcs      chan *descriptor.ServiceDescriptor
 }
 
 // NewThriftFileProvider create a ThriftIDLProvider by given path and include dirs
@@ -39,7 +46,7 @@ func NewThriftFileProvider(path string, includeDirs ...string) (DescriptorProvid
 	if err != nil {
 		return nil, err
 	}
-	svc, err := thrift.Parse(tree)
+	svc, err := thrift.Parse(tree, thrift.DefaultParseMode())
 	if err != nil {
 		return nil, err
 	}
@@ -55,9 +62,18 @@ func (p *thriftFileProvider) Provide() <-chan *descriptor.ServiceDescriptor {
 	return p.svcs
 }
 
+// Close the sending chan.
+func (p *thriftFileProvider) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.svcs)
+	})
+	return nil
+}
+
 // ThriftContentProvider provide descriptor from contents
 type ThriftContentProvider struct {
-	svcs chan *descriptor.ServiceDescriptor
+	closeOnce sync.Once
+	svcs      chan *descriptor.ServiceDescriptor
 }
 
 var _ DescriptorProvider = (*ThriftContentProvider)(nil)
@@ -69,11 +85,11 @@ func NewThriftContentProvider(main string, includes map[string]string) (*ThriftC
 	p := &ThriftContentProvider{
 		svcs: make(chan *descriptor.ServiceDescriptor, 1), // unblock with buffered channel
 	}
-	tree, err := parseContent(defaultMainIDLPath, main, includes, false)
+	tree, err := ParseContent(defaultMainIDLPath, main, includes, false)
 	if err != nil {
 		return nil, err
 	}
-	svc, err := thrift.Parse(tree)
+	svc, err := thrift.Parse(tree, thrift.DefaultParseMode())
 	if err != nil {
 		return nil, err
 	}
@@ -83,11 +99,11 @@ func NewThriftContentProvider(main string, includes map[string]string) (*ThriftC
 
 // UpdateIDL ...
 func (p *ThriftContentProvider) UpdateIDL(main string, includes map[string]string) error {
-	tree, err := parseContent(defaultMainIDLPath, main, includes, false)
+	tree, err := ParseContent(defaultMainIDLPath, main, includes, false)
 	if err != nil {
 		return err
 	}
-	svc, err := thrift.Parse(tree)
+	svc, err := thrift.Parse(tree, thrift.DefaultParseMode())
 	if err != nil {
 		return err
 	}
@@ -107,20 +123,37 @@ func (p *ThriftContentProvider) Provide() <-chan *descriptor.ServiceDescriptor {
 	return p.svcs
 }
 
-func parseIncludes(tree *parser.Thrift, includes map[string]*parser.Thrift, isAbsIncludePath bool) error {
+// Close the sending chan.
+func (p *ThriftContentProvider) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.svcs)
+	})
+	return nil
+}
+
+func parseIncludes(tree *parser.Thrift, parsed map[string]*parser.Thrift, sources map[string]string, isAbsIncludePath bool) (err error) {
 	for _, i := range tree.Includes {
 		p := i.Path
 		if isAbsIncludePath {
 			p = absPath(tree.Filename, i.Path)
 		}
-		ref, ok := includes[p]
-		if !ok {
+		ref, ok := parsed[p] // avoid infinite recursion
+		if ok {
+			i.Reference = ref
+			continue
+		}
+		if src, ok := sources[p]; !ok {
 			return fmt.Errorf("miss include path: %s for file: %s", p, tree.Filename)
+		} else {
+			if ref, err = parser.ParseString(p, src); err != nil {
+				return
+			}
 		}
-		if err := parseIncludes(ref, includes, isAbsIncludePath); err != nil {
-			return err
-		}
+		parsed[p] = ref
 		i.Reference = ref
+		if err = parseIncludes(ref, parsed, sources, isAbsIncludePath); err != nil {
+			return
+		}
 	}
 	return nil
 }
@@ -135,28 +168,30 @@ func absPath(path, includePath string) string {
 	return filepath.Join(filepath.Dir(path), includePath)
 }
 
-func parseContent(path, content string, includes map[string]string, isAbsIncludePath bool) (*parser.Thrift, error) {
+// ParseContent parses the IDL from path and content using provided includes
+func ParseContent(path, content string, includes map[string]string, isAbsIncludePath bool) (*parser.Thrift, error) {
+	if src := includes[path]; src != "" && src != content {
+		return nil, fmt.Errorf("provided main IDL content conflicts with includes: %q", path)
+	}
 	tree, err := parser.ParseString(path, content)
 	if err != nil {
 		return nil, err
 	}
-	_includes := make(map[string]*parser.Thrift, len(includes))
-	for k, v := range includes {
-		t, err := parser.ParseString(k, v)
-		if err != nil {
-			return nil, err
-		}
-		_includes[k] = t
-	}
-	if err := parseIncludes(tree, _includes, isAbsIncludePath); err != nil {
+	parsed := make(map[string]*parser.Thrift)
+	parsed[path] = tree
+	if err := parseIncludes(tree, parsed, includes, isAbsIncludePath); err != nil {
 		return nil, err
+	}
+	if cir := parser.CircleDetect(tree); cir != "" {
+		return tree, fmt.Errorf("IDL circular dependency: %s", cir)
 	}
 	return tree, nil
 }
 
 // ThriftContentWithAbsIncludePathProvider ...
 type ThriftContentWithAbsIncludePathProvider struct {
-	svcs chan *descriptor.ServiceDescriptor
+	closeOnce sync.Once
+	svcs      chan *descriptor.ServiceDescriptor
 }
 
 var _ DescriptorProvider = (*ThriftContentWithAbsIncludePathProvider)(nil)
@@ -170,11 +205,11 @@ func NewThriftContentWithAbsIncludePathProvider(mainIDLPath string, includes map
 	if !ok {
 		return nil, fmt.Errorf("miss main IDL content for main IDL path: %s", mainIDLPath)
 	}
-	tree, err := parseContent(mainIDLPath, mainIDLContent, includes, true)
+	tree, err := ParseContent(mainIDLPath, mainIDLContent, includes, true)
 	if err != nil {
 		return nil, err
 	}
-	svc, err := thrift.Parse(tree)
+	svc, err := thrift.Parse(tree, thrift.DefaultParseMode())
 	if err != nil {
 		return nil, err
 	}
@@ -188,11 +223,11 @@ func (p *ThriftContentWithAbsIncludePathProvider) UpdateIDL(mainIDLPath string, 
 	if !ok {
 		return fmt.Errorf("miss main IDL content for main IDL path: %s", mainIDLPath)
 	}
-	tree, err := parseContent(mainIDLPath, mainIDLContent, includes, true)
+	tree, err := ParseContent(mainIDLPath, mainIDLContent, includes, true)
 	if err != nil {
 		return err
 	}
-	svc, err := thrift.Parse(tree)
+	svc, err := thrift.Parse(tree, thrift.DefaultParseMode())
 	if err != nil {
 		return err
 	}
@@ -211,4 +246,12 @@ func (p *ThriftContentWithAbsIncludePathProvider) UpdateIDL(mainIDLPath string, 
 // Provide ...
 func (p *ThriftContentWithAbsIncludePathProvider) Provide() <-chan *descriptor.ServiceDescriptor {
 	return p.svcs
+}
+
+// Close the sending chan.
+func (p *ThriftContentWithAbsIncludePathProvider) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.svcs)
+	})
+	return nil
 }
